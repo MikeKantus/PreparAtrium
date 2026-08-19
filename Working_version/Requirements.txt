@@ -1,0 +1,21 @@
+upgrade pip
+PySide6
+numpy
+opencv-python
+scipy
+matplotlib
+h5py
+pillow
+tifffile
+imageio
+pyqtgraph
+scikit-image
+pandas
+sympy
+pyyaml
+rich
+black
+flake8
+pytest
+nanolocz
+opencv-contrib-python
