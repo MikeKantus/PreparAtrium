@@ -15,12 +15,20 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QListWidget,
     QFileDialog, QComboBox, QSlider, QProgressBar, QApplication,
     QSpinBox, QSizePolicy, QCheckBox, QListWidgetItem, QFrame, QGridLayout,
-    QToolButton, QSplitter, QGroupBox, QLineEdit
+    QToolButton, QSplitter, QGroupBox, QLineEdit,
 )
 from PySide6.QtGui import QPixmap, QImage, QIcon, QFont
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
 from core.ui_utils import frame_to_qimage_safe
 from core.preloader_hsafm import preload_hsafm_folder
+from playnano.processing.filters import (
+    remove_plane,
+    row_median_align,
+    zero_mean,
+    polynomial_flatten,
+    gaussian_filter,
+    vertical_flip,
+)
 
 try:
     from playnano.io.loader import load_afm_stack
@@ -86,7 +94,7 @@ class AFMLoaderWidget(QWidget):
         self.main_window = main_window
         self.speed_multiplier = 1.0
         self.setMinimumWidth(200)
-        self.raw_stack = None
+        self.original_stack = None
         self.processed_stack = None
         self.meta = {}
         self.current_file_or_folder = os.getcwd()
@@ -262,7 +270,12 @@ class AFMLoaderWidget(QWidget):
         left_col.addWidget(self.combo_flatten)
         left_col.addWidget(self.btn_apply)
         #left_col.addStretch()
-     
+        
+        #video stacks
+        self.original_stack = None
+        self.current_stack = None
+        self.processed_stack = None
+
         
         
         # --- Advanced Leveling / Flattening Controls ---
@@ -316,18 +329,34 @@ class AFMLoaderWidget(QWidget):
         layout_adv.addWidget(QLabel("Iterations"))
         layout_adv.addWidget(self.slider_iterations)
 
-        # Apply advanced pipeline button
+        # Apply advanced pipeline button, accept and restart
         self.btn_apply_advanced = QPushButton("Apply Advanced Leveling")
-        layout_adv.addWidget(self.btn_apply_advanced)
+        self.btn_accept = QPushButton("Accept preview")
+        self.btn_accept.setMinimumHeight(36)
+        self.btn_accept.setFont(self.btn_font)
+        self.btn_restart = QPushButton("Restart editing")
+        self.btn_restart.setMinimumHeight(36)
+        self.btn_restart.setFont(self.btn_font)
+        row = QHBoxLayout()
+        row.addWidget(self.btn_apply_advanced)
+        row.addWidget(self.btn_accept)
+        row.addWidget(self.btn_restart)
+        layout_adv.addLayout(row)
 
         self.group_advanced.setLayout(layout_adv)
         left_col.addWidget(self.group_advanced)
+        #Video accept and restart
+        
+        
 
         # Explorer connections
         self.btn_refresh_files.clicked.connect(lambda: self.populate_parent_combo(getattr(self, "current_file_or_folder", os.getcwd())))
         self.btn_apply_advanced.clicked.connect(lambda: self.apply_advanced_pipeline(self.processed_stack))
         self.btn_open_in_explorer.clicked.connect(self.open_selected_folder_in_explorer)
         self.combo_parent_files.currentIndexChanged.connect(lambda idx: self.refresh_file_preview())
+        self.btn_accept.clicked.connect(self.accept_preview)
+        self.btn_restart.clicked.connect(self.restart_editing)
+        
         # Si quieres que la preview se llene al inicio, llama populate_parent_combo tras definir current_file_or_folder
 
         center_col = QVBoxLayout()
@@ -353,7 +382,7 @@ class AFMLoaderWidget(QWidget):
         center_col.addLayout(play_row)
         speed_row = QHBoxLayout()
         self.speed_input = QLineEdit()
-        self.speed_input.setPlaceholderText("Speed multiplier (e.g. 0.5, 1, 2)")
+        self.speed_input.setPlaceholderText("Speed multiplier")
         self.speed_input.setText("1.0")
 
         self.btn_set_speed = QPushButton("Set speed")
@@ -436,28 +465,37 @@ class AFMLoaderWidget(QWidget):
         if not os.path.isdir(path):
             return
 
-        # ⭐ PANEL INFERIOR: solo .jpk ⭐
+        # ¿Hay .jpk en esta carpeta?
+        jpk_files = [f for f in os.listdir(path) if f.lower().endswith(".jpk")]
+
+        if jpk_files:
+            print("HS-AFM detected in", path, "→ running preloader...")
+            # Guardar TIFF + JSON en la MISMA carpeta
+            generated_tiffs = preload_hsafm_folder(path, path, self._read_metadata_jpk)
+
+            # Mostrar los TIFF en el panel inferior
+            self._populate_from_file_list(generated_tiffs)
+            self.status_label.setText(f"Preview folder: {os.path.basename(path)}")
+            return
+
+        # Si no hay .jpk → comportamiento normal (TIFF/AVI ya existentes)
         self.list_files.clear()
-        jpk_files = []
+        tif_files = []
 
         for name in os.listdir(path):
             full = os.path.join(path, name)
-            if os.path.isfile(full) and name.lower().endswith((".jpk", ".avi")):
+            if name.lower().endswith((".tif", ".avi")):
                 it = QListWidgetItem(name)
                 it.setData(Qt.UserRole, full)
                 self.list_files.addItem(it)
-                jpk_files.append(full)
+                tif_files.append(full)
 
-        # ⭐ thumbnails SOLO de archivos .jpk
-        if jpk_files:
-            self._populate_from_file_list(jpk_files)
+        if tif_files:
+            self._populate_from_file_list(tif_files)
 
-        # Opcional: actualizar etiqueta de estado
         self.status_label.setText(f"Preview folder: {os.path.basename(path)}")
 
 
-        # ⭐ thumbnails SOLO de archivos .jpk
-        self._populate_from_file_list(jpk_files)
 
     def enter_folder(self, item):
         path = item.data(Qt.UserRole)
@@ -476,24 +514,22 @@ class AFMLoaderWidget(QWidget):
                 it.setData(Qt.UserRole, full)
                 self.list_file_preview.addItem(it)
 
-        # ⭐ PANEL INFERIOR: SOLO .jpk ⭐
+        # ⭐ PANEL INFERIOR: SOLO TIFF y AVI ⭐
         self.list_files.clear()
-        jpk_files = []   # ← ← ← AÑADIR ESTO
+        tif_files = []
 
         for name in os.listdir(path):
             full = os.path.join(path, name)
-            if os.path.isfile(full) and name.lower().endswith((".jpk",".avi")):
+            if os.path.isfile(full) and name.lower().endswith((".tif", ".avi")):
                 it = QListWidgetItem(name)
                 it.setData(Qt.UserRole, full)
                 self.list_files.addItem(it)
-                jpk_files.append(full)
+                tif_files.append(full)
 
         # thumbnails
-        self._populate_from_file_list(jpk_files)
-
+        self._populate_from_file_list(tif_files)
 
     def open_folder_or_files(self):
-        # 1) Usuario selecciona carpeta HS-AFM
         folder = QFileDialog.getExistingDirectory(self, "Select folder with AFM files")
 
         if folder:
@@ -504,19 +540,25 @@ class AFMLoaderWidget(QWidget):
             output_folder = os.path.join(folder, "_preloaded")
             os.makedirs(output_folder, exist_ok=True)
 
-            # Ejecutar preloader (TIFF + JSON)
+            # Ejecutar preloader
             try:
-                from core.preloader_hsafm import preload_hsafm_folder
                 generated_tiffs = preload_hsafm_folder(folder, output_folder, self._read_metadata_jpk)
             except Exception as e:
                 self.status_label.setText(f"Preloader error: {e}")
                 return
 
-            # Mostrar TIFFs en la interfaz
+            # ⭐ CAMBIAR CARPETA ACTUAL A _preloaded ⭐
+            self.current_folder = output_folder
+
+            # ⭐ REFRESCAR EXPLORADOR PARA MOSTRAR TIFF ⭐
+            self.populate_parent_combo(output_folder)
+
+            # ⭐ MOSTRAR TIFF EN PANEL INFERIOR ⭐
             self._populate_from_file_list(generated_tiffs)
+
             return
 
-        # 2) Usuario selecciona archivos individuales (TIFF, AVI, etc.)
+        # Si el usuario selecciona archivos individuales
         filters = (
             "Preloaded AFM TIFF (*.tif);;"
             "Video files (*.avi *.mp4 *.mov);;"
@@ -529,7 +571,6 @@ class AFMLoaderWidget(QWidget):
         if not paths:
             return
 
-        # Filtrar fuera cualquier .jpk (ya no deben procesarse aquí)
         paths = [p for p in paths if not p.lower().endswith(".jpk")]
 
         self.status_label.setText("Loading selected files...")
@@ -537,9 +578,10 @@ class AFMLoaderWidget(QWidget):
 
         self._populate_from_file_list(paths)
 
+
    
     def _populate_from_folder(self, folder):
-        valid_exts = (".jpk", ".h5", ".hdf5", ".asd", ".spm", ".aris", ".h5-jpk", ".npy", ".npz", ".avi", ".mp4", ".mov")
+        valid_exts = (".tif", ".avi", ".mp4", ".mov", ".h5", ".hdf5", ".npy", ".npz")
         files = []
         for fname in sorted(os.listdir(folder)):
             if fname.lower().endswith(valid_exts):
@@ -550,15 +592,15 @@ class AFMLoaderWidget(QWidget):
         self._populate_from_file_list(files)
 
     def _populate_from_file_list(self, paths):
+        paths = [p for p in paths if not p.lower().endswith(".jpk")]
         self.list_files.clear()
         self._file_index = []
         self.meta = {}   # reiniciar metadatos para nueva selección
-        paths = [p for p in paths if not p.lower().endswith(".jpk")]
+        
 
         for p in paths:
             try:
                 frames, file_meta = self._read_file_to_frames(p)
-
                 # Miniatura
                 thumb = self._make_thumbnail(frames[0])
                 item = QListWidgetItem(QIcon(thumb), f"{os.path.basename(p)}  —  {len(frames)} frames")
@@ -578,6 +620,33 @@ class AFMLoaderWidget(QWidget):
                 for k, v in file_meta.items():
                     if k not in self.meta or self.meta[k] in (None, "-", "unknown"):
                         self.meta[k] = v
+                # ============================================================
+                #   BUILD STACK FROM SELECTED TIFFS AND SEND TO MAINWINDOW
+                # ============================================================
+
+                # Si el usuario ha seleccionado varios TIFFs → construir stack
+                selected_items = self.list_files.selectedItems()
+                if selected_items:
+                    selected_tiffs = [item.data(Qt.UserRole) for item in selected_items]
+
+                    try:
+                        stack, metas = self.build_stack_from_tiffs(selected_tiffs)
+
+                        # Asignar stacks internos
+                        self.original_stack = stack.astype(np.float32)
+                        self.current_stack = self.original_stack.copy()
+                        self.processed_stack = self.current_stack.copy()
+
+                        # Enviar metadatos combinados (self.meta ya está rellenado arriba)
+                        if self.main_window is not None:
+                            self.main_window.load_afm(self.current_stack, self.meta)
+
+                        self.status_label.setText(
+                            f"Video built: {self.current_stack.shape[0]} frames — sent to MainWindow"
+                        )
+
+                    except Exception as e:
+                        self.status_label.setText(f"Error building stack: {e}")
 
             except Exception as e:
                 item = QListWidgetItem(f"{os.path.basename(p)}  —  ERROR: {e}")
@@ -939,8 +1008,8 @@ class AFMLoaderWidget(QWidget):
     def update_metadata_panel(self):
         # Num Imgs
         num_imgs = self.meta.get("total_frames")
-        if num_imgs is None and self.raw_stack is not None:
-            num_imgs = self.raw_stack.shape[0]
+        if num_imgs is None and self.original_stack is not None:
+            num_imgs = self.original_stack.shape[0]
         self.meta_labels["num_imgs"].setText(str(num_imgs) if num_imgs is not None else "-")
 
         # --- X/Y pixels: usar SIEMPRE los metadatos JPK si existen ---
@@ -948,9 +1017,9 @@ class AFMLoaderWidget(QWidget):
         y_pixels = self.meta.get("y_pixels")
 
         # fallback solo si no hay metadatos
-        if (x_pixels is None or y_pixels is None) and self.raw_stack is not None:
-            y_pixels = self.raw_stack.shape[-2]
-            x_pixels = self.raw_stack.shape[-1]
+        if (x_pixels is None or y_pixels is None) and self.original_stack is not None:
+            y_pixels = self.original_stack.shape[-2]
+            x_pixels = self.original_stack.shape[-1]
 
         self.meta_labels["x_pixels"].setText(str(x_pixels) if x_pixels is not None else "-")
         self.meta_labels["y_pixels"].setText(str(y_pixels) if y_pixels is not None else "-")
@@ -1000,9 +1069,9 @@ class AFMLoaderWidget(QWidget):
 
     def populate_list(self):
         self.list_files.clearSelection()
-        if self.raw_stack is None:
+        if self.original_stack is None:
             return
-        n = len(self.raw_stack)
+        n = len(self.original_stack)
         self.spin_frame.setMaximum(max(0, n - 1))
         self.slider_time.setMaximum(max(0, n - 1))
         self.current_frame = 0
@@ -1066,7 +1135,7 @@ class AFMLoaderWidget(QWidget):
     def on_list_selection_changed(self):
         """
         Cuando el usuario selecciona uno o varios archivos en la lista,
-        cargamos solo esos archivos y concatenamos sus frames en raw_stack.
+        cargamos solo esos archivos y concatenamos sus frames en original_stack.
         También enriquecemos los metadatos usando read_metadata(path).
         """
 
@@ -1123,8 +1192,8 @@ class AFMLoaderWidget(QWidget):
         # ---------------------------------------------------------
         # 3) Actualizar stacks y metadatos base
         # ---------------------------------------------------------
-        self.raw_stack = new_stack
-        self.processed_stack = self.raw_stack.copy()
+        self.original_stack = new_stack
+        self.processed_stack = self.original_stack.copy()
 
         # ⭐ metadatos base del loader (solo del primer archivo)
         if meta_accum:
@@ -1240,7 +1309,7 @@ class AFMLoaderWidget(QWidget):
     # Histogram preview sliders
     # -------------------------
     def on_histogram_slider_changed(self, _val=None):
-        base = self.processed_stack if self.processed_stack is not None else self.raw_stack
+        base = self.current_stack if self.current_stack is not None else self.original_stack
         if base is None:
             return
         lo_pct = self.slider_lower.value()
@@ -1295,42 +1364,43 @@ class AFMLoaderWidget(QWidget):
     # Full processing (background)
     # -------------------------
     def apply_filters(self):
-        # 1) Elegir stack de entrada
-        base_stack = self.processed_stack if self.processed_stack is not None else self.raw_stack
-
-        print("DEBUG apply_filters: processed_stack =", type(self.processed_stack), 
-            getattr(self.processed_stack, "shape", None))
-
-        print("DEBUG apply_filters: raw_stack =", type(self.raw_stack), 
-            getattr(self.raw_stack, "shape", None))
-
-        print("DEBUG apply_filters: base_stack =", type(base_stack), 
-            getattr(base_stack, "shape", None))
-
-
-        if base_stack is None or not isinstance(base_stack, np.ndarray):
-            self.status_label.setText("No valid stack to filter.")
+        if self.original_stack is None:
+            self.status_label.setText("No stack loaded.")
             return
 
+        stack = self.original_stack.copy().astype(np.float64)
 
         level_method = self.combo_level.currentText()
         flat_method = self.combo_flatten.currentText()
-        lo_pct = self.slider_lower.value()
-        hi_pct = self.slider_upper.value()
 
-        self.status_label.setText("Applying basic filters...")
-        QApplication.processEvents()
+        # Aplicar filtros frame‑por‑frame
+        for i in range(stack.shape[0]):
+            frame = stack[i]
 
-        self._thread = ProcessingThread(
-            base_stack,
-            level_method,
-            flat_method,
-            lo_pct,
-            hi_pct
-        )
-        self._thread.finished.connect(self._after_basic_filters)
-        self._thread.start()
-        
+            # LEVELING
+            if level_method == "Plane":
+                frame = remove_plane(frame)
+            elif level_method == "Line":
+                frame = row_median_align(frame)
+
+            # FLATTEN
+            flat_method = self.combo_flatten.currentText()
+            if flat_method == "Histogram":
+                low = self.slider_hist_low.value()
+                high = self.slider_hist_high.value()
+                frame = histogram_clip(frame, low, high)
+            elif flat_method == "Polynomial":
+                order = self.slider_poly_order.value()
+                frame = polynomial_flatten(frame, order=order)
+
+
+            stack[i] = frame
+
+        self.processed_stack = stack.astype(np.float32)
+        self.update_preview()
+        self.status_label.setText("Basic filters applied using PlayNano filters.py.")
+
+       
 
     def _after_basic_filters(self, basic_stack):
         if basic_stack is None or not isinstance(basic_stack, np.ndarray):
@@ -1428,6 +1498,22 @@ class AFMLoaderWidget(QWidget):
 
         return new_stack
         
+    def accept_preview(self):
+        if self.processed_stack is None:
+            self.status_label.setText("No processed stack to accept.")
+            return
+
+        self.current_stack = self.processed_stack.copy()
+        self.status_label.setText("Preview accepted. Current stack updated.")
+    def restart_editing(self):
+        if self.original_stack is None:
+            self.status_label.setText("No original stack loaded.")
+            return
+
+        self.current_stack = self.original_stack.copy()
+        self.processed_stack = self.current_stack.copy()
+        self.update_preview()
+        self.status_label.setText("Editing restarted. Current stack reset.")
 
     def _on_processing_finished(self, stack):
         self.processed_stack = stack
@@ -1469,43 +1555,40 @@ class AFMLoaderWidget(QWidget):
             smooth_sigma,
             iterations
         )
-    def apply_advanced_pipeline(self, stack=None):
-        if stack is None:
-            stack = self.processed_stack if self.processed_stack is not None else self.raw_stack
+    def apply_advanced_pipeline(self, base_stack):
+        if base_stack is None:
+            self.status_label.setText("No stack loaded.")
+            return
 
-        if stack is None or not isinstance(stack, np.ndarray):
-            self.status_label.setText("Advanced pipeline error: no valid stack loaded.")
-            return None
+        stack = base_stack.copy().astype(np.float64)
 
         window_nm = self.slider_window_nm.value()
         step_nm = self.slider_step_nm.value()
         block_px = self.slider_block_px.value()
         poly_order = self.slider_poly_order.value()
-        smooth_sigma = self.slider_smooth_sigma.value()
+        sigma = self.slider_smooth_sigma.value()
         iterations = self.slider_iterations.value()
 
-        try:
+        # Pipeline avanzado iterativo
+        for _ in range(iterations):
+            for i in range(stack.shape[0]):
+                frame = stack[i]
 
-            processed = self.advanced_level_flatten(
-                stack,
-                self.meta,
-                window_nm,
-                step_nm,
-                block_px,
-                poly_order,
-                smooth_sigma,
-                iterations
-            )
-        except Exception as e:
-            self.status_label.setText(f"Advanced pipeline error: {e}")
-            return None
+                # 1) Remove plane (tilt)
+                frame = remove_plane(frame)
 
-        # Encadenar: actualizar processed_stack
-        self.processed_stack = processed
-        self.current_frame = 0
+                # 2) Polynomial flatten
+                frame = polynomial_flatten(frame, order=poly_order)
+
+                # 3) Gaussian smoothing
+                if sigma > 0:
+                    frame = gaussian_filter(frame, sigma=sigma)
+
+                stack[i] = frame
+
+        self.processed_stack = stack.astype(np.float32)
         self.update_preview()
-
-        return processed
+        self.status_label.setText("Advanced pipeline applied using PlayNano filters.py.")
 
     # -------------------------
     # Overlay & preview helpers
@@ -1595,9 +1678,9 @@ class AFMLoaderWidget(QWidget):
         """
         Mostrar el frame actual usando frame_to_qimage_safe.
         Llamar a esta función después de actualizar self.current_frame,
-        self.processed_stack o self.raw_stack.
+        self.processed_stack o self.original_stack.
         """
-        base = self.processed_stack if self.processed_stack is not None else self.raw_stack
+        base = self.processed_stack if self.processed_stack is not None else self.original_stack
         if base is None:
             self.label_preview.clear()
             return
@@ -1629,7 +1712,7 @@ class AFMLoaderWidget(QWidget):
     # Playback
     # -------------------------
     def start_play(self):
-        if self.processed_stack is None:
+        if self.current_stack is None:
             self.status_label.setText("No stack to play")
             return
         fps = self.meta.get("real_fps") or self.meta.get("frame_rate", 10)
@@ -1652,19 +1735,19 @@ class AFMLoaderWidget(QWidget):
         self.status_label.setText("Paused")
 
     def _advance_frame(self):
-        if self.processed_stack is None:
+        if self.current_stack is None:
             return
-        self.current_frame = (self.current_frame + 1) % len(self.processed_stack)
+        self.current_frame = (self.current_frame + 1) % len(self.current_stack)
         self.update_preview()
 
     def prev_frame(self):
-        if self.processed_stack is None:
+        if self.current_stack is None:
             return
         self.current_frame = max(0, self.current_frame - 1)
         self.update_preview()
 
     def next_frame(self):
-        if self.processed_stack is None:
+        if self.current_stack is None:
             return
         self.current_frame = min(len(self.processed_stack) - 1, self.current_frame + 1)
         self.update_preview()
@@ -1681,7 +1764,7 @@ class AFMLoaderWidget(QWidget):
     # Send / Save
     # -------------------------
     def send_to_drift(self):
-        stack = self.processed_stack if self.processed_stack is not None else self.raw_stack
+        stack = self.current_stack if self.current_stack is not None else self.original_stack
         meta = self.meta
         print("DEBUG send_to_drift: stack type =", type(stack))
         print("DEBUG send_to_drift: stack shape =", getattr(stack, "shape", None))
@@ -1696,10 +1779,17 @@ class AFMLoaderWidget(QWidget):
             self.status_label.setText("Sent stack to drift panel")
         else:
             self.status_label.setText("ERROR: main_window not assigned")
+        print("SEND_TO_DRIFT: current_stack =", 
+            None if self.current_stack is None else self.current_stack.shape)
+        print("SEND_TO_DRIFT: processed_stack =", 
+            None if self.processed_stack is None else self.processed_stack.shape)
+        print("SEND_TO_DRIFT: original_stack =", 
+            None if self.original_stack is None else self.original_stack.shape)
+        print("SEND_TO_DRIFT: meta keys =", list(self.meta.keys()))
 
 
     def save_metadata_and_video(self):
-        if self.processed_stack is None:
+        if self.current_stack is None:
             self.status_label.setText("No processed stack to save")
             return
         path, _ = QFileDialog.getSaveFileName(

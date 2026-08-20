@@ -278,9 +278,9 @@ def ecc_align_first(frames, mask_frames):
         aligned.append(aligned_img)
         masks_out.append(aligned_mask)
         ecc_transforms.append(warp_matrix.copy())
-
+        
     return np.array(aligned), np.array(masks_out), ecc_transforms, H_pad, W_pad
-
+    
 
 # ============================================================
 #                   ECC FINAL (sin padding)
@@ -604,9 +604,20 @@ class DriftWindow(QWidget):
             self.trim_start.setMaximum(len(self.frames) - 1)
             self.trim_end.setMaximum(len(self.frames) - 1)
             self.trim_end.setValue(len(self.frames) - 1)
-
+        # Initial masks (all ones)
+            self.drift_masks = np.ones_like(self.frames, dtype=np.uint8)
             self.update_original_frame(0)
+            # Disable manual loading
+            self.btn_load.setEnabled(False)
+            self.btn_load.setVisible(False)
             self.status_label.setText(f"Video loaded from AFMLoader: {len(self.frames)} frames")
+            print("DRIFTWINDOW.__init__: incoming stack =", 
+                None if stack is None else stack.shape)
+            print("DRIFTWINDOW.__init__: incoming meta keys =", 
+                None if meta is None else list(meta.keys()))
+            print("DRIFTWINDOW: frames initialized =", self.frames.shape)
+
+
 
     def build_drift_panel_ui(self):
         """
@@ -881,8 +892,11 @@ class DriftWindow(QWidget):
     # ============================================================
     #                   ECC FIRST PASS
     # ============================================================
-
+    
     def align_initial_ecc(self):
+        print("ECC.align_initial_ecc: frames =", 
+            None if self.frames is None else self.frames.shape)
+
         if self.frames is None:
             self.status_label.setText("Load a video first")
             return
@@ -901,6 +915,24 @@ class DriftWindow(QWidget):
             self.frames, mask_drift
         )
 
+        # --- Recorte automático del padding ---
+        nonzero = np.where(ecc_frames > 0)
+        if len(nonzero[0]) > 0:
+            ymin, ymax = nonzero[0].min(), nonzero[0].max()
+            xmin, xmax = nonzero[1].min(), nonzero[1].max()
+
+            # Si el recorte es demasiado pequeño, ignorarlo
+            if (ymax - ymin) < 20 or (xmax - xmin) < 20:
+                print("ECC.align_initial_ecc: auto-crop too small → using full ECC frames")
+            else:
+                ecc_frames = ecc_frames[:, ymin:ymax+1, xmin:xmax+1]
+                ecc_masks_raw = ecc_masks_raw[:, ymin:ymax+1, xmin:xmax+1]
+                print("ECC.align_initial_ecc: auto-cropped padding → new shape =", ecc_frames.shape)
+        else:
+            print("ECC.align_initial_ecc: WARNING → padding crop failed (all zeros)")
+
+
+        # --- Propagar máscara con ECC ---
         mask_ecc = propagate_mask(
             mask0,
             zero_drift,
@@ -908,6 +940,7 @@ class DriftWindow(QWidget):
             H_pad=H_pad,
             W_pad=W_pad
         )
+
         mask_union = np.max(mask_ecc, axis=0)
         ys, xs = np.where(mask_union > 0)
 
@@ -915,17 +948,32 @@ class DriftWindow(QWidget):
             ymin, ymax = ys.min(), ys.max()
             xmin, xmax = xs.min(), xs.max()
 
-            cropped_frames = ecc_frames[:, ymin:ymax+1, xmin:xmax+1]
-            cropped_masks = mask_ecc[:, ymin:ymax+1, xmin:xmax+1]
+            if (ymax - ymin) < 20 or (xmax - xmin) < 20:
+                print("ECC.align_initial_ecc: mask crop too small → using full ECC frames")
+                self.initial_ecc_frame = ecc_frames
+                self.initial_ecc_masks = mask_ecc
+            else:
+                self.initial_ecc_frame = ecc_frames[:, ymin:ymax+1, xmin:xmax+1]
+                self.initial_ecc_masks = mask_ecc[:, ymin:ymax+1, xmin:xmax+1]
+        else:
+            print("ECC.align_initial_ecc: mask empty → using full ECC frames")
+            self.initial_ecc_frame = ecc_frames
+            self.initial_ecc_masks = mask_ecc
 
-            self.initial_ecc_frame = cropped_frames
-            self.initial_ecc_masks = cropped_masks
+
+        if self.initial_ecc_frame is None:
+            print("ECC.align_initial_ecc: ERROR → initial_ecc_frame is None")
+            self.status_label.setText("ECC failed: empty initial ECC frame")
+            return
+
+        print("ECC.align_initial_ecc: initial_ecc_frame =", self.initial_ecc_frame.shape)
 
         self.slider_initial_ecc.setMaximum(len(self.initial_ecc_frame) - 1)
         self.update_initial_ecc_frame(0)
 
         self.status_label.setText("ECC first pass completed")
         self.progress.setValue(100)
+
 
     def update_initial_ecc_frame(self, idx):
         if self.initial_ecc_frame is None:
@@ -1039,7 +1087,7 @@ class DriftWindow(QWidget):
             except Exception:
                 pass
 
-        self.status_label.setText("Optical Flow alignment completed")
+        self.status_label.setText("alignment completed")
         self.progress.setValue(100)
 
 

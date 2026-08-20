@@ -1,0 +1,21 @@
+{
+  "x_origin_nm": -483.79770084416344,
+  "y_origin_nm": -742.1949696054938,
+  "x_range_nm": 149.99999999999997,
+  "y_range_nm": 149.99999999999997,
+  "x_pixels": 150,
+  "y_pixels": 150,
+  "frame_rate": 150.0,
+  "amplitude": "34.10 \\u00B5V/\\u221AHz",
+  "calibration-environment": "Water",
+  "cantilever-id": "usc-f1_2",
+  "cantilever-name": "USC-F1.2-k0.15",
+  "defined": "true",
+  "frequency": "435.8 kHz",
+  "geometry": "rectangular",
+  "qFactor": "1.299",
+  "sensitivity": "5.19941 nm/V",
+  "spring-constant": "119.536 mN/m",
+  "setpoint-feedback-settings.relative-setpoint": "0.68",
+  "channel": null
+}

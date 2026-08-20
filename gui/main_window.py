@@ -1,14 +1,14 @@
 #gui/main_window.py
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QFrame,
-    QSplitter, QLabel, QPushButton, QSizePolicy
+    QSplitter, QLabel, QPushButton, QSizePolicy, 
 )
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
 from gui.afm_loader import AFMLoaderWidget
 from gui.drift_panel import DriftWindow
 from gui.kymo_panel import KymoPanel   # asegúrate de tener este archivo
-
+from PySide6.QtGui import QPainter
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -110,26 +110,6 @@ class MainWindow(QMainWindow):
         self.splitter_main.setSizes([400, 800, 0])  # panel derecho oculto
 
         # ============================================================
-        #                   PANEL INFERIOR — Cámara de Histogramas
-        # ============================================================
-
-        self.bottom_panel = QFrame()
-        self.bottom_panel.setFrameShape(QFrame.StyledPanel)
-        bottom_layout = QHBoxLayout(self.bottom_panel)
-
-        hist_left = QLabel("Histogram A")
-        hist_right = QLabel("Histogram B")
-
-        hist_left.setAlignment(Qt.AlignCenter)
-        hist_right.setAlignment(Qt.AlignCenter)
-
-        hist_left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        hist_right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        bottom_layout.addWidget(hist_left)
-        bottom_layout.addWidget(hist_right)
-
-        # ============================================================
         #                   CONTENEDOR PRINCIPAL
         # ============================================================
 
@@ -137,8 +117,7 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout(container)
 
         container_layout.addWidget(self.splitter_main, stretch=8)
-        container_layout.addWidget(self.bottom_panel, stretch=2)
-
+        
         self.setCentralWidget(container)
         # ============================================================
         #                   FONDO DEL TEMPLO
@@ -172,8 +151,7 @@ class MainWindow(QMainWindow):
 
         self.center_panel.hide()
         self.right_panel.hide()
-        self.bottom_panel.hide()
-
+        
         # ============================================================
         #                   VARIABLES PARA DRIFT Y KYMO
         # ============================================================
@@ -217,8 +195,11 @@ class MainWindow(QMainWindow):
 
         # Mostrar paneles con animación
         self.center_panel.show()
-        self.bottom_panel.show()
         self.animate_right_panel()
+        print("MAINWINDOW.load_afm: received stack =", 
+            None if stack is None else stack.shape)
+        print("MAINWINDOW.load_afm: received meta keys =", list(meta.keys()))
+
 
     # ============================================================
     #                   ANIMACIÓN PANEL DERECHO
@@ -247,6 +228,8 @@ class MainWindow(QMainWindow):
         self.splitter_main.setSizes([450, 800, 350])
         self.setMinimumSize(768, 512)
         self.resize(1536, 1024)
+
+    
     # ============================================================
     #                   PANEL DE DRIFT (DESPLEGABLE)
     # ============================================================
@@ -285,39 +268,32 @@ class MainWindow(QMainWindow):
             self.right_panel.layout().addWidget(self.drift_widget)
 
         # --- 1) Ocultar/colapsar el panel izquierdo (loader) y poner botón de retorno ---
-        # Guardar referencia al loader original para restaurar después
-        if hasattr(self, "_loader_hidden") and self._loader_hidden:
-            pass
-        else:
-            # ocultar loader widget y reemplazar por un botón simple
+        if not hasattr(self, "_loader_hidden") or not self._loader_hidden:
+            # ocultar loader
             self.loader.hide()
-            self._return_btn_left = QPushButton("Return to video processing")
-            self._return_btn_left.setFixedWidth(50)
-            self._return_btn_left.clicked.connect(self.close_drift_panel)
-            # crear un layout sencillo en left_panel si no existe
+
+            # crear botón vertical
+            self._return_btn_vertical = VerticalButton("Return")
+            self._return_btn_vertical.clicked = self.close_drift_panel
+
+            # limpiar el panel izquierdo
             left_layout = self.left_panel.layout()
-            # limpiar widgets existentes (si quieres mantenerlos, omite)
             while left_layout.count():
                 item = left_layout.takeAt(0)
                 w = item.widget()
                 if w:
                     w.hide()
-            left_layout.addWidget(self._return_btn_left)
+
+            # añadir el botón vertical
+            left_layout.addWidget(self._return_btn_vertical)
+
             self._loader_hidden = True
+
 
         # --- 2) Reemplazar el panel central por un botón (ocultar preview) ---
         # Ocultar controles de vídeo y mostrar botón de retorno grande en centro
         self.center_panel.hide()  # ocultamos el panel central completo
-        # Crear botón grande en su lugar (si no existe)
-        if not hasattr(self, "_return_btn_center"):
-            self._return_btn_center = QPushButton("Return to video processing")
-            self._return_btn_center.setFixedWidth(50)
-            self._return_btn_center.setMinimumHeight(48)
-            self._return_btn_center.clicked.connect(self.close_drift_panel)
-            # Añadir al right place: lo colocamos en left_panel para que sea visible
-            self.left_panel.layout().addWidget(self._return_btn_center)
-
-           # --- 3) Mostrar drift widget y ajustar tamaños para que ocupe mucho espacio ---
+        # --- 3) Mostrar drift widget y ajustar tamaños para que ocupe mucho espacio ---
         self.drift_widget.show()
 
         # Calcular tamaños en píxeles según el ancho actual de la ventana
@@ -370,14 +346,14 @@ class MainWindow(QMainWindow):
 
         # R    # Restaurar animaciones y tamaños usando el ancho actual de la ventana
         total_w = max(1, self.width())
-        left_w = max(1, int(total_w * 0.25))   # tamaño por defecto al cerrar (ajusta si quieres)
-        center_w = max(1, int(total_w * 0.55))
-        right_w = max(1, total_w - left_w - center_w)
+        left_w = max(1, int(total_w * 0.05))   # tamaño por defecto al cerrar (ajusta si quieres)
+        center_w = max(1, int(total_w * 0.95))
+        right_w = 0
 
         anim_right = QPropertyAnimation(self.right_panel, b"maximumWidth")
         anim_right.setDuration(700)
         anim_right.setStartValue(self.right_panel.maximumWidth())
-        anim_right.setEndValue(right_w if right_w > 0 else 350)
+        anim_right.setEndValue(right_w if right_w > 0 else 150)
         anim_right.setEasingCurve(QEasingCurve.OutCubic)
         anim_right.start()
 
@@ -396,13 +372,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_loader_hidden") and self._loader_hidden:
             # quitar botones de retorno añadidos
             try:
-                self.left_panel.layout().removeWidget(self._return_btn_left)
-                self._return_btn_left.deleteLater()
+                self.left_panel.layout().removeWidget(self._return_btn_vertical)
+                self._return_btn_vertical.deleteLater()
             except Exception:
                 pass
-            try:
-                self.left_panel.layout().removeWidget(self._return_btn_center)
-                self._return_btn_center.deleteLater()
             except Exception:
                 pass
 
@@ -462,3 +435,34 @@ class MainWindow(QMainWindow):
         animation.setEndValue([350, 800, 350])
         animation.setEasingCurve(Qt.EasingCurve.OutCubic)
         animation.start()
+class VerticalButton(QLabel):
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedWidth(40)
+        self.setFixedHeight(200)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: rgba(40,40,40,180);
+                border: 1px solid rgba(255,255,255,120);
+                border-radius: 6px;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+            }
+        """)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.translate(self.width()/2, self.height()/2)
+        painter.rotate(90)
+        painter.translate(-self.height()/2, -self.width()/2)
+        super().paintEvent(event)
+
+    def mousePressEvent(self, event):
+        self.clicked()
+
+    def clicked(self):
+        print("Vertical button clicked")
+
