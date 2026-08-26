@@ -13,7 +13,11 @@ def extract_kymograph(stack, line_points, meta):
         print("WARNING: extract_kymograph: meta.pixel_size missing; using fallback pixel_size=1.0")
     frame_rate = None
     if meta is not None:
-        frame_rate = meta.get("frame_rate", None)
+        frame_rate = (
+            meta.get("real_fps")
+            or meta.get("fps")
+            or meta.get("frame_rate")
+        )
 
     if frame_rate is None:
         # fallback visual; si es crítico para resultados científicos, lanzar ValueError en su lugar
@@ -27,7 +31,7 @@ def extract_kymograph(stack, line_points, meta):
     total_length_px = np.sum(distances)
     total_length_nm = total_length_px * pixel_size
 
-    n_samples = int(total_length_px)
+    n_samples = max(2, int(np.ceil(total_length_px)) + 1)
     t = np.linspace(0, 1, n_samples)
 
     fx = interp1d(np.linspace(0, 1, len(xs)), xs)

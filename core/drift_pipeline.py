@@ -1,71 +1,57 @@
 import numpy as np
-from scipy.ndimage import shift as nd_shift
-import cv2
-
-# IMPORTA AQUÍ tus funciones del documento:
-# sample_mask_otsu, clean_mask, propagate_mask,
-# ecc_align_first, ecc_align_final,
-# compute_raw_drift, align_with_auto_canvas
+from core.drift_model import DriftModel
+from core.drift_tools import (
+    ecc_align_first_global,
+    ecc_align_first_sequential,
+    template_matching_global,
+    template_matching_sequential,
+    ecc_align_final,
+    align_with_auto_canvas,
+    crop_to_used_area,
+    sample_mask_otsu,
+    clean_mask,
+    propagate_mask,
+)
 
 class DriftPipeline:
     def __init__(self, stack):
         self.stack = stack
 
-    def run_ecc1(self):
-        frame0 = self.stack[0].astype(np.uint8)
-        mask0 = sample_mask_otsu(frame0)
-        mask0 = clean_mask(mask0)
+    def run_ecc1_global(self):
+        mask0 = clean_mask(sample_mask_otsu(self.stack[0]))
+        zero = np.zeros((len(self.stack), 2))
+        mask_drift = propagate_mask(mask0, zero)
 
-        zero_drift = np.zeros((len(self.stack), 2))
-        mask_drift = propagate_mask(mask0, zero_drift)
+        return ecc_align_first_global(self.stack, mask_drift)
 
-        ecc_frames, ecc_masks_raw, ecc_transforms, H_pad, W_pad = ecc_align_first(
-            self.stack, mask_drift
-        )
+    def run_ecc1_sequential(self):
+        mask0 = clean_mask(sample_mask_otsu(self.stack[0]))
+        zero = np.zeros((len(self.stack), 2))
+        mask_drift = propagate_mask(mask0, zero)
 
-        mask_ecc = propagate_mask(
-            mask0,
-            zero_drift,
-            ecc_transforms,
-            H_pad=H_pad,
-            W_pad=W_pad
-        )
+        return ecc_align_first_sequential(self.stack, mask_drift)
 
-        mask_union = np.max(mask_ecc, axis=0)
-        ys, xs = np.where(mask_union > 0)
-
-        ymin, ymax = ys.min(), ys.max()
-        xmin, xmax = xs.min(), xs.max()
-
-        cropped_frames = ecc_frames[:, ymin:ymax+1, xmin:xmax+1]
-        cropped_masks = mask_ecc[:, ymin:ymax+1, xmin:xmax+1]
-
-        return cropped_frames, cropped_masks
-
-    def run_optical_flow(self, ecc1_stack):
-        drifts = compute_raw_drift(ecc1_stack)
+    def run_tm_global(self, ecc1_stack):
+        drifts, conf = template_matching_global(ecc1_stack)
         aligned, masks = align_with_auto_canvas(ecc1_stack, drifts)
+        aligned, masks = crop_to_used_area(aligned, masks)
+        return aligned, masks, drifts, conf
 
-        mask_union = np.max(masks, axis=0)
-        ys, xs = np.where(mask_union > 0)
+    def run_tm_sequential(self, ecc1_stack):
+        drifts, conf = template_matching_sequential(ecc1_stack)
+        aligned, masks = align_with_auto_canvas(ecc1_stack, drifts)
+        aligned, masks = crop_to_used_area(aligned, masks)
+        return aligned, masks, drifts, conf
 
-        ymin, ymax = ys.min(), ys.max()
-        xmin, xmax = xs.min(), xs.max()
-
-        aligned_crop = aligned[:, ymin:ymax+1, xmin:xmax+1]
-        masks_crop = masks[:, ymin:ymax+1, xmin:xmax+1]
-
-        return aligned_crop, masks_crop, drifts
-
-    def run_ecc2(self, drift_stack, drift_masks, drift_vectors):
-        frame0 = drift_stack[0].astype(np.uint8)
-        mask0 = sample_mask_otsu(frame0)
-        mask0 = clean_mask(mask0)
-
+    def run_ecc2(self, drift_stack, drift_vectors):
+        mask0 = clean_mask(sample_mask_otsu(drift_stack[0]))
         mask_drift = propagate_mask(mask0, drift_vectors)
+        ecc_frames, ecc_masks_raw, ecc_transforms = ecc_align_final(drift_stack, mask_drift)
+        return ecc_frames, ecc_masks_raw, ecc_transforms
 
-        ecc_frames, ecc_masks_raw, ecc_transforms = ecc_align_final(
-            drift_stack, mask_drift
-        )
 
-        return ecc_frames, ecc_masks_raw
+    @staticmethod
+    def process_tm_drifts(drifts, confidence):
+        model = DriftModel(drifts, confidence)
+        return model.interpolate(), model.detect_segments()
+

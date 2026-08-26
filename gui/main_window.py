@@ -7,7 +7,9 @@ from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
 from gui.afm_loader import AFMLoaderWidget
 from gui.drift_panel import DriftWindow
-from gui.kymo_panel import KymoPanel   # asegúrate de tener este archivo
+from gui.kymo_model import KymoModel
+from gui.kymo_canvas import KymoCanvas
+from gui.kymo_panel import KymoPanel# asegúrate de tener este archivo
 from PySide6.QtGui import QPainter
 
 class MainWindow(QMainWindow):
@@ -107,7 +109,9 @@ class MainWindow(QMainWindow):
         self.splitter_main.addWidget(self.center_panel)
         self.splitter_main.addWidget(self.right_panel)
 
-        self.splitter_main.setSizes([400, 800, 0])  # panel derecho oculto
+        # The loader is the initial and normal view; the other panels are
+        # opened only for the corresponding analysis workflows.
+        self.splitter_main.setSizes([1400, 0, 0])
 
         # ============================================================
         #                   CONTENEDOR PRINCIPAL
@@ -193,9 +197,11 @@ class MainWindow(QMainWindow):
 
         self.video_label.setText("AFM stack loaded — ready for analysis")
 
-        # Mostrar paneles con animación
-        self.center_panel.show()
-        self.animate_right_panel()
+        # Keep the loader as the full-width normal view. The analysis panels
+        # are opened explicitly by the user when needed.
+        self.center_panel.hide()
+        self.right_panel.hide()
+        self.splitter_main.setSizes([max(1, self.width()), 0, 0])
         print("MAINWINDOW.load_afm: received stack =", 
             None if stack is None else stack.shape)
         print("MAINWINDOW.load_afm: received meta keys =", list(meta.keys()))
@@ -276,15 +282,11 @@ class MainWindow(QMainWindow):
             self._return_btn_vertical = VerticalButton("Return")
             self._return_btn_vertical.clicked = self.close_drift_panel
 
-            # limpiar el panel izquierdo
+            # Keep the loader in the layout so its geometry is restored when
+            # the drift panel closes.
             left_layout = self.left_panel.layout()
-            while left_layout.count():
-                item = left_layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.hide()
 
-            # añadir el botón vertical
+            # Add the return button below the hidden loader.
             left_layout.addWidget(self._return_btn_vertical)
 
             self._loader_hidden = True
@@ -294,6 +296,8 @@ class MainWindow(QMainWindow):
         # Ocultar controles de vídeo y mostrar botón de retorno grande en centro
         self.center_panel.hide()  # ocultamos el panel central completo
         # --- 3) Mostrar drift widget y ajustar tamaños para que ocupe mucho espacio ---
+        self.right_panel.setMaximumWidth(max(1, self.width()))
+        self.right_panel.show()
         self.drift_widget.show()
 
         # Calcular tamaños en píxeles según el ancho actual de la ventana
@@ -344,28 +348,27 @@ class MainWindow(QMainWindow):
         if self.drift_widget is not None:
             self.drift_widget.hide()
 
-        # R    # Restaurar animaciones y tamaños usando el ancho actual de la ventana
-        total_w = max(1, self.width())
-        left_w = max(1, int(total_w * 0.05))   # tamaño por defecto al cerrar (ajusta si quieres)
-        center_w = max(1, int(total_w * 0.95))
-        right_w = 0
+        # Restore the loader-only layout.
+        left_w, center_w, right_w = max(1, self.width()), 0, 0
 
         anim_right = QPropertyAnimation(self.right_panel, b"maximumWidth")
         anim_right.setDuration(700)
         anim_right.setStartValue(self.right_panel.maximumWidth())
-        anim_right.setEndValue(right_w if right_w > 0 else 150)
+        anim_right.setEndValue(0)
         anim_right.setEasingCurve(QEasingCurve.OutCubic)
         anim_right.start()
 
         anim_center = QPropertyAnimation(self.center_panel, b"maximumWidth")
         anim_center.setDuration(700)
         anim_center.setStartValue(self.center_panel.maximumWidth())
-        anim_center.setEndValue(center_w if center_w > 0 else 800)
+        anim_center.setEndValue(0)
         anim_center.setEasingCurve(QEasingCurve.OutCubic)
         anim_center.start()
 
-        # Restaurar splitter a proporciones razonables (puedes ajustar)
+        # Restore splitter sizes immediately so the loader can relayout.
         self.splitter_main.setSizes([left_w, center_w, right_w])
+        self.center_panel.hide()
+        self.right_panel.hide()
 
 
         # Restaurar loader (panel izquierdo)
@@ -376,11 +379,12 @@ class MainWindow(QMainWindow):
                 self._return_btn_vertical.deleteLater()
             except Exception:
                 pass
-            except Exception:
-                pass
 
-            # volver a mostrar loader
+            # Show the loader again in its original layout position.
             self.loader.show()
+            self.loader.updateGeometry()
+            self.left_panel.layout().invalidate()
+            self.left_panel.layout().activate()
             self._loader_hidden = False
 
         # Restaurar controles del vídeo
@@ -404,6 +408,10 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def open_kymo_panel(self):
+        from core.ui_utils import extend_meta_with_stack_info
+        meta_ext = extend_meta_with_stack_info(self.afm_meta, self.afm_stack)
+        self.kymo_panel = KymoPanel(self.afm_stack, meta_ext)
+
         if self.afm_stack is None:
             self.video_label.setText("Load and send an AFM stack first")
             return

@@ -14,9 +14,6 @@ def preload_hsafm_folder(folder, output_folder, read_metadata_fn):
 
     if not jpk_files:
         raise RuntimeError("No .jpk files found in HS-AFM folder.")
-
-    print("PRELOADER: HS-AFM folder =", folder)
-
     afm = load_afm_stack(folder)
     frames = afm.data
 
@@ -35,17 +32,11 @@ def preload_hsafm_folder(folder, output_folder, read_metadata_fn):
         # Si ya existen TIFF/JSON, no los regeneramos
         if not os.path.exists(tiff_path):
             tifffile.imwrite(tiff_path, frame)
-            print("PRELOADER: wrote", tiff_name)
-        else:
-            print("PRELOADER: TIFF exists, skipping", tiff_name)
 
         if not os.path.exists(json_path):
             meta = read_metadata_fn(jpk_path)
             with open(json_path, "w") as f:
                 json.dump(meta, f, indent=2)
-            print("PRELOADER: wrote", json_name)
-        else:
-            print("PRELOADER: JSON exists, skipping", json_name)
 
         generated_tiffs.append(tiff_path)
 
