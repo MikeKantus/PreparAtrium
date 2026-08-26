@@ -1,5 +1,20 @@
 import numpy as np
 from scipy.interpolate import interp1d
+from dataclasses import dataclass, field
+from typing import Dict, Any
+
+@dataclass
+class KymogramData:
+    """
+    Lightweight container for a kymogram and its metadata/provenance.
+    - data: 2D numpy array (frames, spatial_samples)
+    - metadata: dict with keys like pixel_size_nm, frame_rate, time_per_frame, source_name, etc.
+    - provenance: free-form dict (loader, timestamp, source_file...)
+    """
+    data: np.ndarray
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, Any] = field(default_factory=dict)
+
 
 def extract_kymograph(stack, line_points, meta):
     # Aceptar meta None o incompleto
