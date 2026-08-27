@@ -140,7 +140,18 @@ class KymoModel:
         if key in self._kymo_cache:
             return self._kymo_cache[key]
 
-        kymo, axis_x_nm, axis_t_s = extract_kymograph(self.stack, line, self.meta)
+        # Ensure normalized metadata (pixel size and frame rate / time per frame)
+        meta_for_call = dict(self.meta) if self.meta else {}
+        # Ensure pixel size (nm / pixel) is present
+        meta_for_call.setdefault("pixel_size", self.pixel_size_nm)
+        meta_for_call.setdefault("pixel_size_nm", self.pixel_size_nm)
+        # Ensure frame_rate presence if available
+        if self.frame_rate is not None:
+            meta_for_call.setdefault("frame_rate", self.frame_rate)
+            meta_for_call.setdefault("real_fps", self.frame_rate)
+
+        # Call extractor with guaranteed metadata
+        kymo, axis_x_nm, axis_t_s = extract_kymograph(self.stack, line, meta_for_call)
         result = {
             "kymo": kymo,
             "axis_x_nm": axis_x_nm,
