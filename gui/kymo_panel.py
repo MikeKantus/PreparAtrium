@@ -1,6 +1,4 @@
-import json
-import os
-
+import threading
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -23,6 +21,8 @@ from .kymo_analyzer import KymoAnalyzer
 from .kymo_canvas import KymoCanvas
 from .kymo_controller import KymoController
 from .kymo_model import KymoModel
+from .kymo_manager import KymoManager
+from core.kymo_tools import KymogramData
 
 
 class KymoPanel(QWidget):
@@ -87,7 +87,7 @@ class KymoPanel(QWidget):
         button_layout = QHBoxLayout()
         for button in (self.btn_new_line, self.btn_delete_line,
                    self.btn_end_profile,
-                       self.btn_export, self.btn_analyzer):
+                        self.btn_export, self.btn_analyzer):
             button_layout.addWidget(button)
 
         center_layout = QVBoxLayout()
@@ -202,7 +202,25 @@ class KymoPanel(QWidget):
         index = self.kymo_list.currentRow()
         if index >= 0:
             entry = self.model.kymos[index]
-            self.controller.load_kymo_array(
-                entry["kymo"], self.model.pixel_size_nm,
-                self.model.time_per_frame or 1.0,
-            )
+            # Build a normalized metadata dict for the analyzer
+            meta = dict(self.model.meta) if hasattr(self.model, "meta") and self.model.meta else {}
+            meta["pixel_size"] = self.model.pixel_size_nm
+            if self.model.time_per_frame is not None:
+                meta["time_per_frame"] = self.model.time_per_frame
+            elif getattr(self.model, "frame_rate", None):
+                meta["frame_rate"] = self.model.frame_rate
+
+            kymo_data = KymogramData(data=np.asarray(entry["kymo"], dtype=float),
+                                     metadata=meta,
+                                     provenance={"source": self.model.source_name})
+
+            # Open KymoManager in a separate thread to avoid blocking the Qt event loop
+            def _open_manager():
+                try:
+                    manager = KymoManager(file_paths=None, pixel_size=self.model.pixel_size_nm,
+                                           kymo_array=kymo_data.data, metadata=kymo_data.metadata)
+                except Exception as e:
+                    print("Failed to open KymoManager:", e)
+
+            t = threading.Thread(target=_open_manager, daemon=True)
+            t.start()
