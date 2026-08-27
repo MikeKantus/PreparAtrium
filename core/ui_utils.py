@@ -46,35 +46,54 @@ def frame_to_qimage_safe(frame, percentile_clip=(0.5, 99.5)):
     qimg = QImage(arr.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
     return qimg.copy()
 
+
 def extend_meta_with_stack_info(meta, stack, drift=None, ecc_transforms=None):
     """
     Añade metadatos derivados para trazabilidad completa del análisis.
     No altera los metadatos físicos (nm/pixel, frame_rate, etc.).
+
+    Cambios importantes:
+    - Calcula padding relativo respecto a los tamaños originales guardados en meta (x_pixels_original/y_pixels_original)
+      y no reescribe esos valores si ya están presentes, evitando la acumulación de padding cuando se llama repetidamente.
+    - No muta el `meta` pasado; devuelve un dict extendido.
     """
     if meta is None:
         meta = {}
 
     extended = dict(meta)
 
-    # Tamaño original (si existe en meta)
-    x_orig = meta.get("x_pixels", None)
-    y_orig = meta.get("y_pixels", None)
+    # Tamaño original (si existe en meta, usar x_pixels_original / y_pixels_original si ya se creó)
+    x_orig = meta.get("x_pixels_original", meta.get("x_pixels", None))
+    y_orig = meta.get("y_pixels_original", meta.get("y_pixels", None))
 
     # Tamaño actual del stack
     n_frames = len(stack)
-    y_curr, x_curr = stack[0].shape
+    # soportar stacks que puedan contener canales
+    first = np.asarray(stack[0])
+    if first.ndim == 3:
+        y_curr, x_curr = first.shape[:2]
+    else:
+        y_curr, x_curr = first.shape
 
-    # Padding aplicado (si lo hay)
-    pad_x = x_curr - x_orig if x_orig is not None else None
-    pad_y = y_curr - y_orig if y_orig is not None else None
+    # Padding aplicado — calcular respecto al original almacenado, no respecto al meta actual
+    pad_x = None
+    pad_y = None
+    if x_orig is not None:
+        pad_x = int(max(0, x_curr - x_orig))
+    if y_orig is not None:
+        pad_y = int(max(0, y_curr - y_orig))
 
     # Duración total del vídeo
     frame_rate = meta.get("frame_rate", None)
     total_time_s = n_frames / frame_rate if frame_rate else None
 
+    # Sólo establecer x_pixels_original/y_pixels_original si no existían antes — así evitamos sobrescribir
+    if "x_pixels_original" not in extended and "x_pixels" in meta:
+        extended["x_pixels_original"] = meta.get("x_pixels")
+    if "y_pixels_original" not in extended and "y_pixels" in meta:
+        extended["y_pixels_original"] = meta.get("y_pixels")
+
     extended.update({
-        "x_pixels_original": x_orig,
-        "y_pixels_original": y_orig,
         "x_pixels_current": x_curr,
         "y_pixels_current": y_curr,
         "padding_x_px": pad_x,
@@ -82,10 +101,13 @@ def extend_meta_with_stack_info(meta, stack, drift=None, ecc_transforms=None):
         "n_frames": n_frames,
         "total_time_s": total_time_s,
     })
-    # Drift acumulado (si se pasa)
+
+    # Drift acumulado (si se pasa) — mantener formato compatible
     if drift is not None:
-        extended["drift_dx_px"] = drift[:, 1].tolist()
-        extended["drift_dy_px"] = drift[:, 0].tolist()
+        drift = np.asarray(drift)
+        if drift.ndim == 2 and drift.shape[1] >= 2:
+            extended["drift_dx_px"] = drift[:, 1].tolist()
+            extended["drift_dy_px"] = drift[:, 0].tolist()
 
     # ECC transforms (si se pasan)
     if ecc_transforms is not None:
