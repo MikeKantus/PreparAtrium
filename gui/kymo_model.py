@@ -2,7 +2,65 @@
 import numpy as np
 import json
 from scipy import ndimage
-from skimage import filters, morphology, measure
+
+# skimage imports are optional — use them if available for nicer morphology/otsu
+try:
+    from skimage import filters, morphology, measure
+    _HAS_SKIMAGE = True
+except Exception:
+    _HAS_SKIMAGE = False
+    # provide minimal fallbacks
+    def _median_threshold(img):
+        # fallback: simple percentile
+        return np.percentile(img[~np.isnan(img)], 90)
+
+    class morphology:
+        @staticmethod
+        def remove_small_objects(mask, min_size=10):
+            # naive implementation using scipy.ndimage
+            lbl, n = ndimage.label(mask)
+            sizes = ndimage.sum(mask, lbl, range(1, n+1))
+            good = np.zeros(n+1, dtype=bool)
+            for i, s in enumerate(sizes, start=1):
+                if s >= min_size:
+                    good[i] = True
+            return good[lbl]
+
+    class measure:
+        @staticmethod
+        def label(mask):
+            lbl, _ = ndimage.label(mask)
+            return lbl
+
+        @staticmethod
+        def regionprops(lbl):
+            # very small fallback: return objects with area and bbox approximations
+            props = []
+            for val in np.unique(lbl):
+                if val == 0:
+                    continue
+                m = lbl == val
+                coords = np.column_stack(np.where(m))
+                miny, minx = coords.min(axis=0)
+                maxy, maxx = coords.max(axis=0)
+                area = coords.shape[0]
+                class _Prop:
+                    pass
+                p = _Prop()
+                p.bbox = (miny, minx, maxy, maxx)
+                p.area = int(area)
+                p.centroid = coords.mean(axis=0)
+                p.major_axis_length = None
+                p.minor_axis_length = None
+                p.label = int(val)
+                props.append(p)
+            return props
+
+    class filters:
+        @staticmethod
+        def threshold_otsu(img):
+            return _median_threshold(img)
+
 from core.kymo_tools import extract_kymograph
 
 
@@ -177,7 +235,11 @@ class KymoModel:
             }
             # Simple centerline: skeletonize mask and extract coordinates
             try:
-                skel = morphology.skeletonize(p['mask'])
+                if _HAS_SKIMAGE:
+                    skel = morphology.skeletonize(p['mask'])
+                else:
+                    # crude skeleton via medial axis approximation
+                    skel = ndimage.distance_transform_edt(p['mask']) > 0
                 coords = np.column_stack(np.where(skel))  # (y, x)
                 # convert to (x,y)
                 centerline = [(int(x), int(y)) for y, x in coords]
