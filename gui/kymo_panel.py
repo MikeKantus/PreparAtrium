@@ -1,6 +1,6 @@
 import threading
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -214,13 +214,12 @@ class KymoPanel(QWidget):
                                      metadata=meta,
                                      provenance={"source": self.model.source_name})
 
-            # Open KymoManager in a separate thread to avoid blocking the Qt event loop
-            def _open_manager():
+            # Schedule opening the KymoManager on the Qt main loop (safe for GUI backends)
+            def _open():
                 try:
-                    manager = KymoManager(file_paths=None, pixel_size=self.model.pixel_size_nm,
-                                           kymo_array=kymo_data.data, metadata=kymo_data.metadata)
+                    KymoManager(file_paths=None, pixel_size=self.model.pixel_size_nm,
+                                kymo_array=kymo_data.data, metadata=kymo_data.metadata)
                 except Exception as e:
                     print("Failed to open KymoManager:", e)
 
-            t = threading.Thread(target=_open_manager, daemon=True)
-            t.start()
+            QTimer.singleShot(0, _open)
