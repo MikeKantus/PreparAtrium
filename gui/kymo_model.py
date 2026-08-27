@@ -1,6 +1,8 @@
 # kymo_model.py
 import numpy as np
 import json
+from scipy import ndimage
+from skimage import filters, morphology, measure
 from core.kymo_tools import extract_kymograph
 
 
@@ -37,8 +39,9 @@ class KymoModel:
         # --- lista de kymogramas generados ---
         self.kymos = []
 
-        # --- caché de kymogramas ---
+        # --- cachés ---
         self._kymo_cache = {}
+        self._panorama_cache = None
 
     # ============================================================
     #                   METADATOS FÍSICOS
@@ -125,17 +128,78 @@ class KymoModel:
         self.polymers = []
         self.centerlines = [list(line) for line in self.manual_lines]
 
+    def detect_polymers(self, min_size_px=50, elongation_thresh=2.0):
+        """Detect candidate tubular polymers in the first frame using Otsu thresholding + morphology.
+
+        Results are stored in self.polymers as dicts with keys: mask, label, bbox, centroid, centerline (approx).
+        """
+        img = self.stack[0].astype(np.float32)
+        # Normalizar
+        img = img - np.nanmin(img)
+        if np.nanmax(img) > 0:
+            img = img / np.nanmax(img)
+
+        # Threshold (Otsu)
+        try:
+            th = filters.threshold_otsu(img)
+        except Exception:
+            th = np.percentile(img[~np.isnan(img)], 90)
+        mask = img >= th
+
+        # Morphological cleaning
+        mask = morphology.remove_small_objects(mask, min_size=10)
+        mask = morphology.binary_closing(mask, morphology.disk(3))
+        mask = ndimage.binary_fill_holes(mask)
+
+        labels = measure.label(mask)
+        props = measure.regionprops(labels)
+
+        self.polymers = []
+        for i, prop in enumerate(props, start=1):
+            if prop.area < min_size_px:
+                continue
+            # elongation approximate: area / (minor_axis_length^2)
+            if hasattr(prop, 'minor_axis_length') and prop.minor_axis_length > 0:
+                elong = max(prop.major_axis_length / (prop.minor_axis_length + 1e-6), 1.0)
+            else:
+                elong = 1.0
+            if elong < elongation_thresh:
+                continue
+
+            p = {
+                'label': f'poly_{i}',
+                'mask': (labels == prop.label),
+                'bbox': prop.bbox,
+                'centroid': prop.centroid,
+                'area': prop.area,
+                'major_axis_length': getattr(prop, 'major_axis_length', None),
+                'minor_axis_length': getattr(prop, 'minor_axis_length', None),
+            }
+            # Simple centerline: skeletonize mask and extract coordinates
+            try:
+                skel = morphology.skeletonize(p['mask'])
+                coords = np.column_stack(np.where(skel))  # (y, x)
+                # convert to (x,y)
+                centerline = [(int(x), int(y)) for y, x in coords]
+            except Exception:
+                centerline = []
+
+            p['centerline'] = centerline
+            self.polymers.append(p)
+        # cache invalidation for panorama if polymers affect it
+        self._panorama_cache = None
+
     # ============================================================
     #                   KYMOGRAMAS
     # ============================================================
 
-    def generate_kymograph(self, line):
+    def generate_kymograph(self, line, radius_px=0, method='mean', subpixel=False):
         """
         Genera un kymograma para una línea dada.
         Usa extract_kymograph(stack, line, meta).
         Cachea resultados para acelerar la UI.
         """
-        key = tuple((int(x), int(y)) for x, y in line)
+        key = (tuple((int(x), int(y)) for x, y in line), int(radius_px), method, bool(subpixel))
 
         if key in self._kymo_cache:
             return self._kymo_cache[key]
@@ -151,7 +215,8 @@ class KymoModel:
             meta_for_call.setdefault("real_fps", self.frame_rate)
 
         # Call extractor with guaranteed metadata
-        kymo, axis_x_nm, axis_t_s = extract_kymograph(self.stack, line, meta_for_call)
+        kymo, axis_x_nm, axis_t_s = extract_kymograph(
+            self.stack, line, meta_for_call, radius_px=radius_px, method=method)
         result = {
             "kymo": kymo,
             "axis_x_nm": axis_x_nm,
@@ -160,6 +225,89 @@ class KymoModel:
 
         self._kymo_cache[key] = result
         return result
+
+    # ============================================================
+    #                   PANORAMA
+    # ============================================================
+
+    def build_panorama(self, mode='max'):
+        """Build a panorama (projection) from the stack.
+
+        mode: 'max' or 'mean'
+        If drift offsets present in self.meta (drift_dx_px, drift_dy_px per frame) they will be used to place frames.
+        """
+        if self._panorama_cache is not None:
+            return self._panorama_cache
+
+        # Determine per-frame offsets from meta if available
+        n = len(self.stack)
+        offsets = None
+        if 'drift_offsets_px' in self.meta:
+            offsets = self.meta['drift_offsets_px']
+            if len(offsets) != n:
+                offsets = None
+        elif 'drift_dx_px' in self.meta and 'drift_dy_px' in self.meta:
+            dx = self.meta.get('drift_dx_px')
+            dy = self.meta.get('drift_dy_px')
+            if hasattr(dx, '__len__') and hasattr(dy, '__len__') and len(dx) == n and len(dy) == n:
+                offsets = list(zip(dx, dy))
+
+        H = self.stack.shape[1]
+        W = self.stack.shape[2]
+
+        if offsets is None:
+            # simple projection matching original frame size
+            if mode == 'max':
+                pano = np.nanmax(self.stack, axis=0)
+            else:
+                pano = np.nanmean(self.stack, axis=0)
+            self._panorama_cache = pano
+            return pano
+
+        # Compute required canvas size
+        xs = [ox for ox, oy in offsets]
+        ys = [oy for ox, oy in offsets]
+        min_x = int(min(0, min(xs)))
+        min_y = int(min(0, min(ys)))
+        max_x = int(max(0, max(xs)))
+        max_y = int(max(0, max(ys)))
+
+        canvas_w = W + (max_x - min_x)
+        canvas_h = H + (max_y - min_y)
+
+        canvas = np.full((canvas_h, canvas_w), np.nan, dtype=self.stack.dtype)
+
+        for i, frame in enumerate(self.stack):
+            ox, oy = offsets[i]
+            # top-left position in canvas
+            x0 = int(ox - min_x)
+            y0 = int(oy - min_y)
+            x1 = x0 + W
+            y1 = y0 + H
+            # place frame
+            sub = canvas[y0:y1, x0:x1]
+            if mode == 'max':
+                # combine with nanmax
+                combined = np.fmax(np.nan_to_num(sub, nan=-np.inf), np.nan_to_num(frame, nan=-np.inf))
+                combined[combined == -np.inf] = np.nan
+                canvas[y0:y1, x0:x1] = combined
+            else:
+                # mean combination with counting
+                if not hasattr(self, '_pano_acc'):
+                    self._pano_acc = np.zeros_like(canvas, dtype=np.float64)
+                    self._pano_cnt = np.zeros_like(canvas, dtype=np.int32)
+                mask = ~np.isnan(frame)
+                self._pano_acc[y0:y1, x0:x1][mask] += frame[mask]
+                self._pano_cnt[y0:y1, x0:x1][mask] += 1
+
+        if mode != 'max':
+            with np.errstate(invalid='ignore', divide='ignore'):
+                canvas = self._pano_acc / (self._pano_cnt + 1e-12)
+            del self._pano_acc
+            del self._pano_cnt
+
+        self._panorama_cache = canvas
+        return canvas
 
     # ============================================================
     #                   UTILIDADES
@@ -180,15 +328,21 @@ class KymoModel:
 
     def clear_cache(self):
         """
-        Limpia el caché de kymogramas.
+        Limpia el caché de kymogramas y panoramas.
         """
         self._kymo_cache = {}
-# ============================================================
-#                   KYMOGRAMAS GUARDADOS
-# ============================================================
+        self._panorama_cache = None
+        if hasattr(self, '_pano_acc'):
+            del self._pano_acc
+        if hasattr(self, '_pano_cnt'):
+            del self._pano_cnt
 
-    def add_kymograph_from_line(self, line, label=None):
-        result = self.generate_kymograph(line)
+    # ============================================================
+    #                   KYMOGRAMAS GUARDADOS
+    # ============================================================
+
+    def add_kymograph_from_line(self, line, label=None, radius_px=0, method='mean', subpixel=False):
+        result = self.generate_kymograph(line, radius_px=radius_px, method=method, subpixel=subpixel)
 
         # Frame asociado al kymo (primer punto de la línea)
         # Si la línea se dibuja en un frame concreto, el canvas ya sabe cuál es:
