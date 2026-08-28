@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.interpolate import interp1d
 from dataclasses import dataclass
+from scipy.ndimage import map_coordinates
 
 @dataclass
 class KymogramData:
@@ -10,7 +11,7 @@ class KymogramData:
     metadata: dict
 
 
-def extract_kymograph(stack, line_points, meta, radius_px=0, method='mean'):
+def extract_kymograph(stack, line_points, meta, radius_px=0, method='mean', subpixel=False):
     """Extract kymograph along a polyline with optional perpendicular averaging.
 
     Parameters
@@ -25,6 +26,8 @@ def extract_kymograph(stack, line_points, meta, radius_px=0, method='mean'):
         Radius in pixels for perpendicular averaging (default 0: single-pixel profile)
     method : {'mean', 'median', 'max'}
         Aggregation method across perpendicular samples.
+    subpixel : bool
+        If True, use bilinear interpolation (map_coordinates order=1) for sampling; otherwise round to nearest integer.
 
     Returns
     -------
@@ -104,10 +107,20 @@ def extract_kymograph(stack, line_points, meta, radius_px=0, method='mean'):
             except Exception:
                 frame = np.asarray(frame)
                 H, W = frame.shape
-        # clamp indices and sample with nearest integer indexing
-        sx = np.clip(np.round(sample_grid_x).astype(int), 0, W-1)
-        sy = np.clip(np.round(sample_grid_y).astype(int), 0, H-1)
-        vals = frame[sy, sx]  # broadcasting: (n_samples, n_offsets)
+        # clamp indices
+        sx = np.clip(sample_grid_x, 0, W-1)
+        sy = np.clip(sample_grid_y, 0, H-1)
+
+        if subpixel:
+            # map_coordinates expects coordinates as (dim, indices), where first axis is y then x
+            coords = np.vstack((sy.ravel(), sx.ravel()))
+            vals = map_coordinates(frame, coords, order=1, mode='nearest').reshape(sy.shape)
+        else:
+            ix = np.round(sx).astype(int)
+            iy = np.round(sy).astype(int)
+            vals = frame[iy, ix]
+
+        # vals shape: (n_samples, n_offsets)
         if vals.ndim == 2:
             if method == 'mean':
                 prof = np.nanmean(vals, axis=1)

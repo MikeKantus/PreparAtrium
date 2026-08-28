@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
+    QSpinBox,
+    QCheckBox,
 )
 
 from .kymo_analyzer import KymoAnalyzer
@@ -62,6 +64,22 @@ class KymoPanel(QWidget):
         self.btn_export.clicked.connect(self.export_all_kymos)
         self.btn_analyzer.clicked.connect(self.open_analyzer)
 
+        # New controls: panoramic overlay, radius, subpixel, detect polymers
+        self.chk_panorama = QCheckBox("Panoramic overlay")
+        self.chk_panorama.setChecked(False)
+        self.chk_panorama.stateChanged.connect(self._on_panorama_toggled)
+
+        self.spin_radius = QSpinBox()
+        self.spin_radius.setRange(0, 10)
+        self.spin_radius.setValue(1)
+        self.spin_radius.setToolTip("Radius in pixels for perpendicular averaging")
+
+        self.chk_subpixel = QCheckBox("Sub-pixel sampling (bilinear)")
+        self.chk_subpixel.setChecked(False)
+
+        self.btn_detect_polymers = QPushButton("Detect polymers")
+        self.btn_detect_polymers.clicked.connect(self._on_detect_polymers)
+
         metadata_box = QGroupBox("Metadata")
         self.metadata_layout = QFormLayout(metadata_box)
         self.metadata_layout.setLabelAlignment(Qt.AlignLeft)
@@ -90,11 +108,20 @@ class KymoPanel(QWidget):
                         self.btn_export, self.btn_analyzer):
             button_layout.addWidget(button)
 
+        # Add new control layout
+        extra_controls = QHBoxLayout()
+        extra_controls.addWidget(self.chk_panorama)
+        extra_controls.addWidget(QLabel("Radius:"))
+        extra_controls.addWidget(self.spin_radius)
+        extra_controls.addWidget(self.chk_subpixel)
+        extra_controls.addWidget(self.btn_detect_polymers)
+
         center_layout = QVBoxLayout()
         center_layout.addWidget(QLabel("Video"))
         center_layout.addWidget(self.canvas, 1)
         center_layout.addLayout(frame_controls)
         center_layout.addLayout(button_layout)
+        center_layout.addLayout(extra_controls)
         center_widget = QWidget()
         center_widget.setLayout(center_layout)
 
@@ -113,6 +140,18 @@ class KymoPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(splitter)
+
+    def _on_panorama_toggled(self, state):
+        self.canvas.panorama_overlay = bool(state)
+        self.canvas.update()
+
+    def _on_detect_polymers(self):
+        # run detection and refresh canvas
+        try:
+            self.model.detect_polymers()
+            self.canvas.update()
+        except Exception as e:
+            print("Polymer detection failed:", e)
 
     def _refresh_metadata(self):
         while self.metadata_layout.rowCount():
@@ -155,7 +194,10 @@ class KymoPanel(QWidget):
         line = list(self.canvas.active_line)
         self.model.add_manual_line(line)
         self.canvas.active_line = []
-        entry = self.model.add_kymograph_from_line(line)
+        # use radius and subpixel options
+        radius = int(self.spin_radius.value())
+        subpixel = bool(self.chk_subpixel.isChecked())
+        entry = self.model.add_kymograph_from_line(line, radius_px=radius, subpixel=subpixel)
         self.kymo_list.addItem(QListWidgetItem(entry["label"]))
         self.canvas.update()
 
