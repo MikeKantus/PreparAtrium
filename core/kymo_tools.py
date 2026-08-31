@@ -1,14 +1,18 @@
 import numpy as np
 from scipy.interpolate import interp1d
+<<<<<<< Updated upstream
 from dataclasses import dataclass
 from scipy.ndimage import map_coordinates
+=======
+from dataclasses import dataclass, field
+from typing import Any, Dict
+>>>>>>> Stashed changes
 
 @dataclass
 class KymogramData:
-    kymo: np.ndarray
-    axis_x_nm: np.ndarray
-    axis_t_s: np.ndarray
-    metadata: dict
+    data: np.ndarray
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, Any] = field(default_factory=dict)
 
 
 def extract_kymograph(stack, line_points, meta, radius_px=0, method='mean', subpixel=False):

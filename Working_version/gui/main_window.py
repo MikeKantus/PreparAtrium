@@ -1,14 +1,16 @@
 #gui/main_window.py
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QFrame,
-    QSplitter, QLabel, QPushButton, QSizePolicy
+    QSplitter, QLabel, QPushButton, QSizePolicy, 
 )
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
 from gui.afm_loader import AFMLoaderWidget
 from gui.drift_panel import DriftWindow
-from gui.kymo_panel import KymoPanel   # asegúrate de tener este archivo
-
+from gui.kymo_model import KymoModel
+from gui.kymo_canvas import KymoCanvas
+from gui.kymo_panel import KymoPanel# asegúrate de tener este archivo
+from PySide6.QtGui import QPainter
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -107,27 +109,9 @@ class MainWindow(QMainWindow):
         self.splitter_main.addWidget(self.center_panel)
         self.splitter_main.addWidget(self.right_panel)
 
-        self.splitter_main.setSizes([400, 900, 0])  # panel derecho oculto
-
-        # ============================================================
-        #                   PANEL INFERIOR — Cámara de Histogramas
-        # ============================================================
-
-        self.bottom_panel = QFrame()
-        self.bottom_panel.setFrameShape(QFrame.StyledPanel)
-        bottom_layout = QHBoxLayout(self.bottom_panel)
-
-        hist_left = QLabel("Histogram A")
-        hist_right = QLabel("Histogram B")
-
-        hist_left.setAlignment(Qt.AlignCenter)
-        hist_right.setAlignment(Qt.AlignCenter)
-
-        hist_left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        hist_right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        bottom_layout.addWidget(hist_left)
-        bottom_layout.addWidget(hist_right)
+        # The loader is the initial and normal view; the other panels are
+        # opened only for the corresponding analysis workflows.
+        self.splitter_main.setSizes([1400, 0, 0])
 
         # ============================================================
         #                   CONTENEDOR PRINCIPAL
@@ -137,8 +121,7 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout(container)
 
         container_layout.addWidget(self.splitter_main, stretch=8)
-        container_layout.addWidget(self.bottom_panel, stretch=2)
-
+        
         self.setCentralWidget(container)
         # ============================================================
         #                   FONDO DEL TEMPLO
@@ -172,8 +155,7 @@ class MainWindow(QMainWindow):
 
         self.center_panel.hide()
         self.right_panel.hide()
-        self.bottom_panel.hide()
-
+        
         # ============================================================
         #                   VARIABLES PARA DRIFT Y KYMO
         # ============================================================
@@ -183,6 +165,26 @@ class MainWindow(QMainWindow):
 
         self.drift_widget = None
         self.kymo_panel = None
+        # ============================================================
+        #                   White color
+        # ============================================================
+
+
+        self.setStyleSheet(self.styleSheet() + """
+            QLabel, QPushButton {
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+            }
+
+            QPushButton {
+                background-color: rgba(40,40,40,180);
+                border: 1px solid rgba(255,255,255,120);
+                padding: 6px;
+                border-radius: 6px;
+            }
+        """)
+
 
     # ============================================================
     #                   MÉTODOS DEL MAINWINDOW
@@ -195,10 +197,15 @@ class MainWindow(QMainWindow):
 
         self.video_label.setText("AFM stack loaded — ready for analysis")
 
-        # Mostrar paneles con animación
-        self.center_panel.show()
-        self.bottom_panel.show()
-        self.animate_right_panel()
+        # Keep the loader as the full-width normal view. The analysis panels
+        # are opened explicitly by the user when needed.
+        self.center_panel.hide()
+        self.right_panel.hide()
+        self.splitter_main.setSizes([max(1, self.width()), 0, 0])
+        print("MAINWINDOW.load_afm: received stack =", 
+            None if stack is None else stack.shape)
+        print("MAINWINDOW.load_afm: received meta keys =", list(meta.keys()))
+
 
     # ============================================================
     #                   ANIMACIÓN PANEL DERECHO
@@ -209,7 +216,7 @@ class MainWindow(QMainWindow):
 
         # Animación del panel derecho
         anim_right = QPropertyAnimation(self.right_panel, b"maximumWidth")
-        anim_right.setDuration(600)
+        anim_right.setDuration(5000)
         anim_right.setStartValue(0)
         anim_right.setEndValue(350)
         anim_right.setEasingCurve(QEasingCurve.OutCubic)
@@ -217,18 +224,39 @@ class MainWindow(QMainWindow):
 
         # Animación del panel central (ligero ajuste)
         anim_center = QPropertyAnimation(self.center_panel, b"maximumWidth")
-        anim_center.setDuration(600)
+        anim_center.setDuration(5000)
         anim_center.setStartValue(900)
         anim_center.setEndValue(800)
         anim_center.setEasingCurve(QEasingCurve.OutCubic)
         anim_center.start()
 
         # Ajuste final del splitter (sin animación)
-        self.splitter_main.setSizes([350, 800, 350])
+        self.splitter_main.setSizes([450, 800, 350])
+        self.setMinimumSize(768, 512)
+        self.resize(1536, 1024)
 
+    
     # ============================================================
     #                   PANEL DE DRIFT (DESPLEGABLE)
     # ============================================================
+    def resizeEvent(self, event):
+        # Mantener ratio 1536x1024
+        target_ratio = 1536 / 1024
+        w = self.width()
+        h = self.height()
+
+        current_ratio = w / h
+
+        if current_ratio > target_ratio:
+            # ventana demasiado ancha → ajustamos ancho
+            new_w = int(h * target_ratio)
+            self.resize(new_w, h)
+        else:
+            # ventana demasiado alta → ajustamos alto
+            new_h = int(w / target_ratio)
+            self.resize(w, new_h)
+
+        super().resizeEvent(event)
 
     def open_drift_panel(self):
         if self.afm_stack is None:
@@ -246,39 +274,30 @@ class MainWindow(QMainWindow):
             self.right_panel.layout().addWidget(self.drift_widget)
 
         # --- 1) Ocultar/colapsar el panel izquierdo (loader) y poner botón de retorno ---
-        # Guardar referencia al loader original para restaurar después
-        if hasattr(self, "_loader_hidden") and self._loader_hidden:
-            pass
-        else:
-            # ocultar loader widget y reemplazar por un botón simple
+        if not hasattr(self, "_loader_hidden") or not self._loader_hidden:
+            # ocultar loader
             self.loader.hide()
-            self._return_btn_left = QPushButton("Return to video processing")
-            self._return_btn_left.setFixedWidth(50)
-            self._return_btn_left.clicked.connect(self.close_drift_panel)
-            # crear un layout sencillo en left_panel si no existe
+
+            # crear botón vertical
+            self._return_btn_vertical = VerticalButton("Return")
+            self._return_btn_vertical.clicked = self.close_drift_panel
+
+            # Keep the loader in the layout so its geometry is restored when
+            # the drift panel closes.
             left_layout = self.left_panel.layout()
-            # limpiar widgets existentes (si quieres mantenerlos, omite)
-            while left_layout.count():
-                item = left_layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.hide()
-            left_layout.addWidget(self._return_btn_left)
+
+            # Add the return button below the hidden loader.
+            left_layout.addWidget(self._return_btn_vertical)
+
             self._loader_hidden = True
+
 
         # --- 2) Reemplazar el panel central por un botón (ocultar preview) ---
         # Ocultar controles de vídeo y mostrar botón de retorno grande en centro
         self.center_panel.hide()  # ocultamos el panel central completo
-        # Crear botón grande en su lugar (si no existe)
-        if not hasattr(self, "_return_btn_center"):
-            self._return_btn_center = QPushButton("Return to video processing")
-            self._return_btn_center.setFixedWidth(50)
-            self._return_btn_center.setMinimumHeight(48)
-            self._return_btn_center.clicked.connect(self.close_drift_panel)
-            # Añadir al right place: lo colocamos en left_panel para que sea visible
-            self.left_panel.layout().addWidget(self._return_btn_center)
-
-           # --- 3) Mostrar drift widget y ajustar tamaños para que ocupe mucho espacio ---
+        # --- 3) Mostrar drift widget y ajustar tamaños para que ocupe mucho espacio ---
+        self.right_panel.setMaximumWidth(max(1, self.width()))
+        self.right_panel.show()
         self.drift_widget.show()
 
         # Calcular tamaños en píxeles según el ancho actual de la ventana
@@ -329,46 +348,43 @@ class MainWindow(QMainWindow):
         if self.drift_widget is not None:
             self.drift_widget.hide()
 
-        # R    # Restaurar animaciones y tamaños usando el ancho actual de la ventana
-        total_w = max(1, self.width())
-        left_w = max(1, int(total_w * 0.25))   # tamaño por defecto al cerrar (ajusta si quieres)
-        center_w = max(1, int(total_w * 0.55))
-        right_w = max(1, total_w - left_w - center_w)
+        # Restore the loader-only layout.
+        left_w, center_w, right_w = max(1, self.width()), 0, 0
 
         anim_right = QPropertyAnimation(self.right_panel, b"maximumWidth")
         anim_right.setDuration(700)
         anim_right.setStartValue(self.right_panel.maximumWidth())
-        anim_right.setEndValue(right_w if right_w > 0 else 350)
+        anim_right.setEndValue(0)
         anim_right.setEasingCurve(QEasingCurve.OutCubic)
         anim_right.start()
 
         anim_center = QPropertyAnimation(self.center_panel, b"maximumWidth")
         anim_center.setDuration(700)
         anim_center.setStartValue(self.center_panel.maximumWidth())
-        anim_center.setEndValue(center_w if center_w > 0 else 800)
+        anim_center.setEndValue(0)
         anim_center.setEasingCurve(QEasingCurve.OutCubic)
         anim_center.start()
 
-        # Restaurar splitter a proporciones razonables (puedes ajustar)
+        # Restore splitter sizes immediately so the loader can relayout.
         self.splitter_main.setSizes([left_w, center_w, right_w])
+        self.center_panel.hide()
+        self.right_panel.hide()
 
 
         # Restaurar loader (panel izquierdo)
         if hasattr(self, "_loader_hidden") and self._loader_hidden:
             # quitar botones de retorno añadidos
             try:
-                self.left_panel.layout().removeWidget(self._return_btn_left)
-                self._return_btn_left.deleteLater()
-            except Exception:
-                pass
-            try:
-                self.left_panel.layout().removeWidget(self._return_btn_center)
-                self._return_btn_center.deleteLater()
+                self.left_panel.layout().removeWidget(self._return_btn_vertical)
+                self._return_btn_vertical.deleteLater()
             except Exception:
                 pass
 
-            # volver a mostrar loader
+            # Show the loader again in its original layout position.
             self.loader.show()
+            self.loader.updateGeometry()
+            self.left_panel.layout().invalidate()
+            self.left_panel.layout().activate()
             self._loader_hidden = False
 
         # Restaurar controles del vídeo
@@ -392,6 +408,10 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def open_kymo_panel(self):
+        from core.ui_utils import extend_meta_with_stack_info
+        meta_ext = extend_meta_with_stack_info(self.afm_meta, self.afm_stack)
+        self.kymo_panel = KymoPanel(self.afm_stack, meta_ext)
+
         if self.afm_stack is None:
             self.video_label.setText("Load and send an AFM stack first")
             return
@@ -423,3 +443,34 @@ class MainWindow(QMainWindow):
         animation.setEndValue([350, 800, 350])
         animation.setEasingCurve(Qt.EasingCurve.OutCubic)
         animation.start()
+class VerticalButton(QLabel):
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedWidth(40)
+        self.setFixedHeight(200)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: rgba(40,40,40,180);
+                border: 1px solid rgba(255,255,255,120);
+                border-radius: 6px;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+            }
+        """)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.translate(self.width()/2, self.height()/2)
+        painter.rotate(90)
+        painter.translate(-self.height()/2, -self.width()/2)
+        super().paintEvent(event)
+
+    def mousePressEvent(self, event):
+        self.clicked()
+
+    def clicked(self):
+        print("Vertical button clicked")
+

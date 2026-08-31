@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QIcon, QFont
 from AFMReader.asd import load_asd
 from AFMReader.spm import load_spm
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize
 from core.ui_utils import frame_to_qimage_safe
 from core.preloader_hsafm import preload_hsafm_folder
 from playnano.processing.filters import (
@@ -59,31 +59,6 @@ def numpy_to_qimage(frame):
     return QImage(arr.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
 
 
-class ProcessingThread(QThread):
-    finished = Signal(np.ndarray)
-   
-
-    def __init__(self, stack, level_method, flat_method, lo_pct, hi_pct):
-        super().__init__()
-        self.stack = stack.astype(np.float32)
-        self.level_method = level_method
-        self.flat_method = flat_method
-        self.lo_pct = lo_pct
-        self.hi_pct = hi_pct
-
-    def run(self):
-        stack = self.stack.copy()
-        try:
-            lo = np.percentile(stack, self.lo_pct)
-            hi = np.percentile(stack, self.hi_pct)
-            if hi <= lo:
-                hi = lo + 1e-6
-            stack = np.clip(stack, lo, hi)
-        except Exception:
-            pass
-
-        self.finished.emit(stack)
-
 class AFMLoaderWidget(QWidget):
     def __init__(self, main_window=None):
         super().__init__()
@@ -114,7 +89,7 @@ class AFMLoaderWidget(QWidget):
             "x_pixels": ["x_pixels", "x_num_pix", "width_px"],
             "y_pixels": ["y_pixels", "y_num_pix", "height_px"],
             "channel": ["channel", "mode", "signal"]
-        }       
+        }
 
 
         # fonts and sizes
@@ -471,7 +446,7 @@ class AFMLoaderWidget(QWidget):
         except Exception:
             # no bloquear si algo falla en startup
             pass
-        
+
 
     # -------------------------
     # Loading folder / files
@@ -517,7 +492,7 @@ class AFMLoaderWidget(QWidget):
                     if tiffs and (expected_frames is None or len(tiffs) == expected_frames):
                         generated_tiffs.extend(tiffs)
                         continue
-            
+
                 # Cargar ASD
                 result = load_asd(full, channel="TP")
                 # Desempaquetado correcto para tu loader
@@ -742,6 +717,11 @@ class AFMLoaderWidget(QWidget):
         self.list_files.clear()
         self._file_index = []
         self.meta = {}   # reiniciar metadatos para nueva selección
+       # Nombre base del vídeo original (primer archivo de la lista)
+        if paths:
+            first = paths[0]          # ESTE es el archivo correcto
+            self.meta["source_name"] = os.path.splitext(os.path.basename(first))[0]
+
 
         for p in paths:
             try:
@@ -782,7 +762,7 @@ class AFMLoaderWidget(QWidget):
                                 self.meta[panel_key] = val
 
                     except Exception as e:
-                        print("DEBUG: error leyendo JSON ASD:", e)
+                        print("DEBUG: error reading JSON ASD:", e)
 
                 # -----------------------------
                 # 3) Metadatos extendidos (JPK/STP/etc)
@@ -831,7 +811,7 @@ class AFMLoaderWidget(QWidget):
                 with open(json_path, "r") as f:
                     return json.load(f)
             except Exception as e:
-                print("DEBUG error leyendo JSON:", e)
+                print("DEBUG error reading JSON:", e)
                 # continuar intentando otras rutas
 
         # ------------------------------------------------------------
@@ -1014,17 +994,6 @@ class AFMLoaderWidget(QWidget):
 
         stack = np.stack(frames)
         return stack, metas
-    def load_single_jpk(path):
-        from playnano.io.loader import load_afm_stack
-
-        afm = load_afm_stack(path)   # carga un solo frame
-        frames = afm.data            # shape (1, H, W)
-        meta = {
-            "pixel_size_nm": afm.pixel_size_nm,
-            "channel": afm.channel,
-            "frame_metadata": afm.frame_metadata,
-        }
-        return frames, meta
     def load_tiff_with_metadata(self, tiff_path):
         frame = tifffile.imread(tiff_path)
 
@@ -1088,24 +1057,9 @@ class AFMLoaderWidget(QWidget):
             for i, frame in enumerate(frames):
                 tifffile.imwrite(f"{base}_frame{i}.tif", frame.astype(np.float32))
 
-            # Guardar JSON
+            # Save JSON.
             with open(out_json, "w") as f:
                 json.dump(meta, f, indent=2)
-            print("DEBUG _read_file_to_frames:", p, "file_meta:", file_meta)
-             # Si es un TIFF generado desde ASD, intenta leer el JSON hermano
-            base = os.path.splitext(path)[0]
-            # quitar sufijo _frameXX
-            if "_frame" in base:
-                base_root = base.split("_frame")[0]
-                json_path = base_root + ".json"
-                if os.path.exists(json_path):
-                    try:
-                        with open(json_path, "r") as f:
-                            file_meta = json.load(f)
-                        print("DEBUG loaded ASD JSON meta for", path, "->", json_path)
-                    except Exception as e:
-                        print("DEBUG error reading ASD JSON:", e)
-
             return frames, meta
 
 
@@ -1114,7 +1068,7 @@ class AFMLoaderWidget(QWidget):
         # ------------------------------------------------------------
         if p.lower().endswith(".asd"):
             from AFMReader.asd import load_asd
-          
+
 
             base = os.path.splitext(p)[0]
             out_json = base + ".json"
@@ -1151,8 +1105,7 @@ class AFMLoaderWidget(QWidget):
 
             return frames, meta
 
-
-        # Si es TIFF → cargar imagen + metadatos JSON/JPK
+        # TIFF: load the image and its JSON/JPK metadata.
         if ext == ".jpk":
             raise ValueError("Direct JPK loading is disabled. Use TIFF+JSON preloader.")
 
@@ -1202,24 +1155,8 @@ class AFMLoaderWidget(QWidget):
 
             
 
-        # Si hay muchos .jpk → es HS-AFM
-        if ext == ".jpk" and HAS_PLAYNANO:
-            afm = load_afm_stack(folder)
-            frames = afm.data
-
-            # Seleccionar solo el archivo que el usuario eligió
-            sorted_files = sorted(jpk_files)
-            idx = sorted_files.index(os.path.basename(p))
-            frames = frames[idx:idx+1]
-
-            meta = {
-                "pixel_size_nm": afm.pixel_size_nm,
-                "channel": afm.channel,
-                "frame_metadata": [afm.frame_metadata[idx]],
-            }
-            return frames, meta   
         try:
-            
+
             with h5py.File(p, "r") as f:
                 # find dataset
                 def find_dataset(group):
@@ -1254,7 +1191,16 @@ class AFMLoaderWidget(QWidget):
                     except Exception:
                         pass
 
-                # pick keys
+                def pick_first(values, keys):
+                    for key in keys:
+                        if key in values:
+                            value = values[key]
+                            if isinstance(value, bytes):
+                                value = value.decode("utf-8", errors="replace")
+                            return value
+                    return None
+
+                # Pick known metadata keys.
                 file_meta = {}
                 file_meta["pixel_size_nm"] = pick_first(attrs, ["pixel_size_nm", "pixel_size", "pixel_size_x"])
                 file_meta["frame_rate"] = pick_first(attrs, ["frame_rate", "fps"])
@@ -1438,7 +1384,7 @@ class AFMLoaderWidget(QWidget):
         # Reset metadata
         self.meta = {}
 
-        # Collect selected TIFF paths
+        # Collect selected supported files.
         sel_paths = [it.data(Qt.UserRole) for it in selected_items if it.data(Qt.UserRole)]
         if not sel_paths:
             self.status_label.setText("No valid files selected.")
@@ -1448,11 +1394,12 @@ class AFMLoaderWidget(QWidget):
         total_frames = 0
 
         # ---------------------------------------------------------
-        # 1) Load frames from all selected TIFFs (ONLY tifffile.imread)
+        # 1) Load frames through the format-aware loader.
         # ---------------------------------------------------------
+        file_metas = []
         for p in sel_paths:
             try:
-                img = tifffile.imread(p)
+                img, file_meta = self._read_file_to_frames(p)
 
                 # Ensure 3D stack
                 if img.ndim == 2:
@@ -1463,6 +1410,7 @@ class AFMLoaderWidget(QWidget):
                     raise ValueError(f"Invalid TIFF shape: {img.shape}")
 
                 all_frames.append(img)
+                file_metas.append(file_meta or {})
                 total_frames += img.shape[0]
 
             except Exception as e:
@@ -1486,23 +1434,13 @@ class AFMLoaderWidget(QWidget):
         self.processed_stack = None
 
         # ---------------------------------------------------------
-        # 4) Load metadata from JSON (first file only)
+        # 4) Use metadata returned by the same loader as the first file.
         # ---------------------------------------------------------
-        base = os.path.splitext(sel_paths[0])[0]
-        json_guess = base.split("_frame")[0] + ".json"
-
-        if os.path.exists(json_guess):
-            try:
-                with open(json_guess, "r") as f:
-                    meta_json = json.load(f)
-
-                for panel_key in self.meta_aliases.keys():
-                    val = self.resolve_meta_value(meta_json, panel_key)
-                    if val is not None:
-                        self.meta[panel_key] = val
-
-            except Exception as e:
-                print("DEBUG JSON error:", e)
+        meta_json = file_metas[0] if file_metas else {}
+        for panel_key in self.meta_aliases.keys():
+            val = self.resolve_meta_value(meta_json, panel_key)
+            if val is not None:
+                self.meta[panel_key] = val
 
         self.meta["total_frames"] = total_frames
         self.meta["source_files"] = sel_paths
@@ -1519,82 +1457,6 @@ class AFMLoaderWidget(QWidget):
         self.status_label.setText(
             f"Loaded {total_frames} frames from {len(sel_paths)} selected files"
         )
-
-    def advanced_level_flatten(
-        self,
-        stack,
-        meta,
-        window_nm,
-        step_nm,
-        block_px,
-        poly_order,
-        smooth_sigma,
-        iterations
-    ):
-
-        # ⭐ IMPORTAR AQUÍ (garantizado)
-        from pnanolocz import leveling, flattening
-
-        # Pixel size
-        px_nm = meta.get("pixel_size_nm", None)
-        if px_nm is None:
-            px_nm = (meta.get("x_range_nm", 1000) / meta.get("x_pixels", 512))
-
-        window_px = max(4, int(window_nm / px_nm))
-        step_px = max(2, int(step_nm / px_nm))
-
-        def local_plane_level(frame):
-            h, w = frame.shape
-            out = frame.copy()
-            for y in range(0, h - window_px, step_px):
-                for x in range(0, w - window_px, step_px):
-                    block = frame[y:y+window_px, x:x+window_px]
-                    leveled = leveling.plane_level(block)
-                    out[y:y+window_px, x:x+window_px] = leveled
-            return out
-
-        def block_flatten(frame):
-            h, w = frame.shape
-            out = frame.copy()
-            for y in range(0, h, block_px):
-                for x in range(0, w, block_px):
-                    block = frame[y:y+block_px, x:x+block_px]
-                    flat = flattening.flatten_histogram(block)
-                    out[y:y+block_px, x:x+block_px] = flat
-            return out
-
-        def polynomial_detrend(frame):
-            yy, xx = np.indices(frame.shape)
-            X = np.column_stack([
-                np.ones_like(xx).ravel(),
-                xx.ravel(), yy.ravel(),
-                (xx*yy).ravel(),
-                (xx**2).ravel(),
-                (yy**2).ravel()
-            ])[:, :poly_order+3]
-            y = frame.ravel()
-            coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-            trend = (X @ coef).reshape(frame.shape)
-            return frame - trend
-
-        def smooth(frame):
-            if smooth_sigma <= 0:
-                return frame
-            return cv2.GaussianBlur(frame, (0, 0), smooth_sigma)
-
-        new_stack = stack.astype(np.float32).copy()
-
-        for _ in range(iterations):
-            for i in range(len(new_stack)):
-                f = new_stack[i]
-                f = local_plane_level(f)
-                f = block_flatten(f)
-                f = polynomial_detrend(f)
-                f = smooth(f)
-                new_stack[i] = f
-
-        return new_stack
-
 
     # -------------------------
     # Histogram preview sliders
@@ -1677,9 +1539,13 @@ class AFMLoaderWidget(QWidget):
             # FLATTEN
             flat_method = self.combo_flatten.currentText()
             if flat_method == "Histogram":
-                low = self.slider_hist_low.value()
-                high = self.slider_hist_high.value()
-                frame = histogram_clip(frame, low, high)
+                low = self.slider_lower.value()
+                high = self.slider_upper.value()
+                if high <= low:
+                    self.status_label.setText("Histogram upper must be > lower")
+                    return
+                low_value, high_value = np.percentile(frame, [low, high])
+                frame = np.clip(frame, low_value, high_value)
             elif flat_method == "Polynomial":
                 order = self.slider_poly_order.value()
                 frame = polynomial_flatten(frame, order=order)
@@ -1714,77 +1580,15 @@ class AFMLoaderWidget(QWidget):
         smooth_sigma=0.0,
         iterations=1
     ):
-        """
-        Pipeline avanzado de leveling + flattening inspirado en NanoLocz.
-        Todos los parámetros son configurables desde la interfaz.
-        """
-
-        # --- Pixel size ---
-        px_nm = meta.get("pixel_size_nm", None)
-        if px_nm is None:
-            px_nm = (meta.get("x_range_nm", 1000) / meta.get("x_pixels", 512))
-
-        # --- Convertir nm → px ---
-        window_px = max(4, int(window_nm / px_nm))
-        step_px = max(2, int(step_nm / px_nm))
-
-        # --- Funciones internas ---
-        def local_plane_level(frame):
-            h, w = frame.shape
-            out = frame.copy()
-
-            for y in range(0, h - window_px, step_px):
-                for x in range(0, w - window_px, step_px):
-                    block = frame[y:y+window_px, x:x+window_px]
-                    leveled = leveling.plane_level(block)
-                    out[y:y+window_px, x:x+window_px] = leveled
-
-            return out
-
-        def block_flatten(frame):
-            h, w = frame.shape
-            out = frame.copy()
-
-            for y in range(0, h, block_px):
-                for x in range(0, w, block_px):
-                    block = frame[y:y+block_px, x:x+block_px]
-                    flat = flattening.flatten_histogram(block)
-                    out[y:y+block_px, x:x+block_px] = flat
-
-            return out
-
-        def polynomial_detrend(frame):
-            yy, xx = np.indices(frame.shape)
-            X = np.column_stack([
-                np.ones_like(xx).ravel(),
-                xx.ravel(), yy.ravel(),
-                (xx*yy).ravel(),
-                (xx**2).ravel(),
-                (yy**2).ravel()
-            ])[:, :poly_order+3]
-
-            y = frame.ravel()
-            coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-            trend = (X @ coef).reshape(frame.shape)
-            return frame - trend
-
-        def smooth(frame):
-            if smooth_sigma <= 0:
-                return frame
-            return cv2.GaussianBlur(frame, (0, 0), smooth_sigma)
-
-        # --- Pipeline ---
+        """Apply the advanced pipeline using the imported PlayNano filters."""
         new_stack = stack.astype(np.float32).copy()
-
         for _ in range(iterations):
             for i in range(len(new_stack)):
-                f = new_stack[i]
-                f = local_plane_level(f)
-                f = block_flatten(f)
-                f = polynomial_detrend(f)
-                f = smooth(f)
-                new_stack[i] = f
-
+                frame = remove_plane(new_stack[i])
+                frame = polynomial_flatten(frame, order=poly_order)
+                if smooth_sigma > 0:
+                    frame = gaussian_filter(frame, sigma=smooth_sigma)
+                new_stack[i] = frame
         return new_stack
         
     def accept_preview(self):
@@ -1887,7 +1691,6 @@ class AFMLoaderWidget(QWidget):
         Return frame with overlay text scaled to image size.
         Always returns a uint8, C-contiguous 2D array (grayscale).
         """
-       
 
         arr = np.asarray(frame)
 
@@ -2003,7 +1806,10 @@ class AFMLoaderWidget(QWidget):
         if self.current_stack is None:
             self.status_label.setText("No stack to play")
             return
-        fps = self.meta.get("real_fps") or self.meta.get("frame_rate", 10)
+        try:
+            fps = float(self.meta.get("real_fps") or self.meta.get("frame_rate") or 10)
+        except (TypeError, ValueError):
+            fps = 10.0
         interval = int(max(1, fps / self.speed_multiplier))
         self._timer.start(interval)
         self.status_label.setText("Playing")
@@ -2037,7 +1843,7 @@ class AFMLoaderWidget(QWidget):
     def next_frame(self):
         if self.current_stack is None:
             return
-        self.current_frame = min(len(self.processed_stack) - 1, self.current_frame + 1)
+        self.current_frame = min(len(self.current_stack) - 1, self.current_frame + 1)
         self.update_preview()
 
     def on_spin_frame_changed(self, val):
@@ -2065,7 +1871,7 @@ class AFMLoaderWidget(QWidget):
             self.status_label.setText("Sent stack to drift panel")
         else:
             self.status_label.setText("ERROR: main_window not assigned")
-       
+
     def save_metadata_and_video(self):
         if self.current_stack is None:
             self.status_label.setText("No processed stack to save")
@@ -2077,9 +1883,10 @@ class AFMLoaderWidget(QWidget):
             "AVI Files (*.avi);;MP4 Files (*.mp4)"
         )
 
-        if not folder:
+        if not path:
             return
-        meta_path = os.path.join(folder, "afm_metadata.json")
+        folder = os.path.dirname(path)
+        meta_path = os.path.splitext(path)[0] + "_metadata.json"
         try:
             with open(meta_path, "w") as f:
                 json.dump(self.meta, f, indent=2, default=str)
@@ -2087,33 +1894,34 @@ class AFMLoaderWidget(QWidget):
             self.status_label.setText(f"Error saving metadata: {e}")
             return
         try:
-            H, W = self.processed_stack[0].shape
-            out_path = os.path.join(folder, "afm_processed.avi")
+            stack = np.asarray(self.current_stack)
+            H, W = stack[0].shape
             fourcc = cv2.VideoWriter_fourcc(*"XVID")
             fps = self.meta.get("frame_rate", 10) or 10
-            writer = cv2.VideoWriter(out_path, fourcc, float(fps), (W, H), False)
-            meta_frame = self._make_metadata_frame()
+            writer = cv2.VideoWriter(path, fourcc, float(fps), (W, H), False)
+            if not writer.isOpened():
+                raise OSError(f"Could not open video writer for {path}")
+            meta_frame = self._make_metadata_frame(H, W)
             writer.write(meta_frame)
-            for f in self.processed_stack:
+            for f in stack:
                 arr = f.astype(np.float32)
-                arr = arr - np.nanmin(arr)
-                rng = np.nanmax(arr)
-                if rng == 0:
-                    rng = 1.0
-                arr = (arr / rng * 255.0).astype(np.uint8)
+                lo, hi = np.nanmin(arr), np.nanmax(arr)
+                if hi <= lo:
+                    arr = np.zeros_like(arr, dtype=np.uint8)
+                else:
+                    arr = ((arr - lo) / (hi - lo) * 255.0).astype(np.uint8)
                 writer.write(arr)
             writer.release()
         except Exception as e:
             self.status_label.setText(f"Error saving video: {e}")
             return
-        self.status_label.setText(f"Saved metadata and video to {folder}")
-    def _make_metadata_frame(self):
+        self.status_label.setText(f"Saved metadata and video to {path}")
+
+    def _make_metadata_frame(self, height, width):
         meta_json = json.dumps(self.meta)
         meta_bytes = meta_json.encode("utf-8")
 
-        # Tamaño fijo del frame
-        H, W = 200, 200
-        frame = np.zeros((H, W), dtype=np.uint8)
+        frame = np.zeros((height, width), dtype=np.uint8)
 
         # Escribir bytes en los primeros píxeles
         flat = frame.ravel()

@@ -142,8 +142,7 @@ class DriftWindow(QWidget):
         self.ecc_masks = None
 
         self.setWindowTitle("PreparAtrium – Drift and ECC Alignment")
-        self.setMinimumSize(900, 500)
-        self.resize(1300, 700)
+        self.setFixedSize(1536, 1024)
 
         # ============================================================
         #                   CREATE ALL WIDGETS
@@ -181,27 +180,26 @@ class DriftWindow(QWidget):
 
         self.label_original = QLabel("Original video not loaded")
         self.label_original.setAlignment(Qt.AlignCenter)
-        self.label_original.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label_original.setMinimumSize(300, 220)
+        self.label_original.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.label_original.setMinimumSize(0, 0)
         self.label_original.setScaledContents(False)
 
         self.label_current = QLabel("Current stack not available")
         self.label_current.setAlignment(Qt.AlignCenter)
-        self.label_current.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label_current.setMinimumSize(300, 220)
+        self.label_current.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.label_current.setMinimumSize(0, 0)
         self.label_current.setScaledContents(False)
         self.slider_current = QSlider(Qt.Horizontal)
         self.slider_current.setMaximum(0)
 
         self.label_processed = QLabel("Processed stack not available")
         self.label_processed.setAlignment(Qt.AlignCenter)
-        self.label_processed.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label_processed.setMinimumSize(300, 220)
+        self.label_processed.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.label_processed.setMinimumSize(0, 0)
         self.label_processed.setScaledContents(False)
         self.slider_processed = QSlider(Qt.Horizontal)
         self.slider_processed.setMaximum(0)
 
-        # Compatibility aliases for code that still refers to stage-specific viewers.
         self.label_initial_ecc = self.label_processed
         self.label_drift = self.label_processed
         self.label_fine_ecc = self.label_processed
@@ -215,8 +213,10 @@ class DriftWindow(QWidget):
         grid = QGridLayout()
         grid.setSpacing(8)
         grid.setContentsMargins(8, 8, 8, 8)
+        # Keep the right-side viewers at 60% of the width and reserve 30%
+        # of the height for the processing controls.
         grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(1, 4)
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 1)
 
@@ -276,15 +276,10 @@ class DriftWindow(QWidget):
         title_C1 = QLabel("Processing controls")
         title_C1.setAlignment(Qt.AlignCenter)
         processing_buttons = [
-            self.btn_align_initial_ecc,
-            self.btn_align_initial_ecc_seq,
-            self.btn_align_tm,
-            self.btn_align_tm_seq,
-            self.btn_drift_plot,
-            self.btn_align_fine_ecc,
-            self.btn_accept_preview,
-            self.btn_discard_preview,
-            self.btn_save_fine_ecc,
+            self.btn_align_initial_ecc, self.btn_align_initial_ecc_seq,
+            self.btn_align_tm, self.btn_align_tm_seq, self.btn_drift_plot,
+            self.btn_align_fine_ecc, self.btn_accept_preview,
+            self.btn_discard_preview, self.btn_save_fine_ecc,
             self.btn_open_kymo,
         ]
         panel_C1 = QWidget()
@@ -336,7 +331,7 @@ class DriftWindow(QWidget):
         self.slider_current.valueChanged.connect(self.update_current_frame)
         self.slider_processed.valueChanged.connect(self.update_processed_frame)
 
-        # Drift plot (uses the latest Template Matching drift).
+        # Drift plot (uses tm_drifts).
         self.btn_drift_plot.clicked.connect(self.show_drift)
 
         # Connect the remaining pipeline controls.
@@ -397,9 +392,12 @@ class DriftWindow(QWidget):
         self.original_frames = self.frames.copy()
         self.current_stack = self.frames.copy()
         self.processed_stack = None
+        self.tm_drifts = None
 
         self.slider_original.setMaximum(len(self.frames) - 1)
         self.slider_current.setMaximum(len(self.current_stack) - 1)
+        self.slider_drift.setMaximum(0)
+        self.slider_fine_ecc.setMaximum(0)
         self.slider_processed.setMaximum(0)
 
         self.trim_start.setMaximum(len(self.frames) - 1)
@@ -468,6 +466,14 @@ class DriftWindow(QWidget):
                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
         label.setPixmap(pix)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Render again after the layout has its final geometry. This prevents
+        # the first frame from using the label's placeholder size.
+        self.update_original_frame(self.slider_original.value())
+        self.update_current_frame(self.slider_current.value())
+        self.update_processed_frame(self.slider_processed.value())
+
     def update_current_frame(self, idx=None):
         if idx is None:
             idx = self.slider_current.value()
@@ -476,9 +482,9 @@ class DriftWindow(QWidget):
     def update_processed_frame(self, idx=None):
         if idx is None:
             idx = self.slider_processed.value()
-        self._display_stack_frame(
-            self.processed_stack, idx, self.label_processed, self.processed_masks
-        )
+        # Masks are processing metadata, not a display overlay. Showing them
+        # here makes the preview look like a binary/static mask instead of a video.
+        self._display_stack_frame(self.processed_stack, idx, self.label_processed)
 
     def _set_processed_stack(self, stack, masks=None, drifts=None):
         self.processed_stack = np.asarray(stack).copy()
@@ -492,7 +498,19 @@ class DriftWindow(QWidget):
         if self.processed_stack is None:
             self.status_label.setText("No processed preview to accept")
             return
-        self.current_stack = self.processed_stack.copy()
+        accepted_stack = self.processed_stack
+        accepted_masks = self.processed_masks
+        if accepted_masks is not None and len(accepted_masks) == len(accepted_stack):
+            try:
+                accepted_stack, accepted_masks = crop_to_used_area(
+                    accepted_stack, accepted_masks
+                )
+            except (ValueError, IndexError):
+                # Keep the full preview if no valid coverage region exists.
+                accepted_stack = self.processed_stack.copy()
+                accepted_masks = None
+
+        self.current_stack = np.asarray(accepted_stack).copy()
         self.slider_current.setMaximum(len(self.current_stack) - 1)
         self.slider_current.setValue(0)
         self.update_current_frame(0)
@@ -604,7 +622,8 @@ class DriftWindow(QWidget):
         )
 
         # 5. Auto‑crop (MoviTrack pattern)
-        mask_union = np.max(mask_ecc, axis=0)
+        valid_masks = ecc_masks_raw
+        mask_union = np.max(valid_masks, axis=0)
         ys, xs = np.where(mask_union > 0)
 
         if len(ys) > 0 and len(xs) > 0:
@@ -612,12 +631,12 @@ class DriftWindow(QWidget):
             xmin, xmax = xs.min(), xs.max()
 
             ecc_frames = ecc_frames[:, ymin:ymax+1, xmin:xmax+1]
-            mask_ecc   = mask_ecc[:, ymin:ymax+1, xmin:xmax+1]
+            valid_masks = valid_masks[:, ymin:ymax+1, xmin:xmax+1]
 
         # 6. Save results
         self.initial_ecc_frame = ecc_frames
-        self.initial_ecc_masks = mask_ecc
-        self._set_processed_stack(ecc_frames, mask_ecc)
+        self.initial_ecc_masks = valid_masks
+        self._set_processed_stack(ecc_frames, valid_masks)
 
         self.status_label.setText("Initial ECC completed")
         self.progress.setValue(100)
@@ -687,6 +706,7 @@ class DriftWindow(QWidget):
         self.tm_drifts = drifts_smooth
         self.tm_segments = segments
 
+        # Update UI
         self._set_processed_stack(aligned, masks, drifts)
 
         self.status_label.setText("Template Matching completed")
@@ -958,10 +978,10 @@ class DriftWindow(QWidget):
 
 
     def show_drift(self):
-        if self.drift_drifts is None:
-            self.status_label.setText("Run Optical Flow first")
+        if self.tm_drifts is None:
+            self.status_label.setText("Run Template Matching first")
             return
-        win = PlotWindow(self.drift_drifts, parent=self)
+        win = PlotWindow(self.tm_drifts, parent=self)
         win.exec()
 
     # ============================================================
