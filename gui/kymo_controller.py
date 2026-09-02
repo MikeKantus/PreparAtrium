@@ -356,6 +356,29 @@ class KymoController:
             "stderr_nm_s": float(stderr),
         }
 
+    def manual_pick_profile(self, p0, p1):
+        """Convert a user-picked line in physical coordinates to kymograph pixels."""
+        if self.kymo_roi is None or self.pixel_size is None or self.time_per_frame <= 0:
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        x0_nm, y0_s = p0
+        x1_nm, y1_s = p1
+        px0 = x0_nm / self.pixel_size
+        px1 = x1_nm / self.pixel_size
+        py0 = y0_s / self.time_per_frame
+        py1 = y1_s / self.time_per_frame
+        if np.isclose(py0, py1):
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        ys_pix = np.arange(int(np.floor(min(py0, py1))), int(np.ceil(max(py0, py1))))
+        if len(ys_pix) == 0:
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        xs_pix = np.interp(ys_pix, [py0, py1], [px0, px1])
+        ys_pix = np.clip(ys_pix, 0, self.kymo_roi.shape[0] - 1).astype(int)
+        xs_pix = np.clip(xs_pix, 0, self.kymo_roi.shape[1] - 1).astype(int)
+        return ys_pix, xs_pix
+
     # -------------------------
     # PHASE CLASSIFICATION
     # -------------------------

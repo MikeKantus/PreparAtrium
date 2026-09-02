@@ -27,12 +27,14 @@ class KymoCanvas(QWidget):
 
         # Estado de visualización
         self.current_frame = 0
+        self.panorama_overlay = False
         self.zoom = 1.0
         self.pan_x = 0
         self.pan_y = 0
 
         # Edición de líneas
         self.active_line = []          # línea que el usuario está editando
+        self.selected_kymo_line_index = None
         self.selected_point = None     # índice del punto seleccionado
         self.dragging = False
 
@@ -69,53 +71,81 @@ class KymoCanvas(QWidget):
         painter.drawPixmap(int(image_x), int(image_y), pix)
 
         # --- dibujar panorama overlay si existe y está activado ---
-        if getattr(self.panel, 'panorama_overlay', False):
+        if self.panorama_overlay:
             pano = self.model.build_panorama()
             try:
                 qimg_p = frame_to_qimage_safe(pano)
                 pix_p = QPixmap.fromImage(qimg_p)
-                # escalar y centrar como el frame
-                pix_p = pix_p.scaled(pix.width(), pix.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                painter.setOpacity(0.35)
-                painter.drawPixmap(int(image_x), int(image_y), pix_p)
+
+                # Calcular escala y offsets si el panorama tiene dimensiones distintas al frame
+                pano_h, pano_w = pano.shape
+                frame_h, frame_w = frame.shape
+
+                # Offset relativo del panorama respecto al frame original
+                min_x = getattr(self.model, '_pano_min_x', 0)
+                min_y = getattr(self.model, '_pano_min_y', 0)
+
+                scaled_w = pano_w * self.zoom
+                scaled_h = pano_h * self.zoom
+
+                pix_p = pix_p.scaled(int(scaled_w), int(scaled_h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                # Posicionar el panorama respetando la alineación/drift en el canvas
+                pano_x = image_x + (min_x * self.zoom)
+                pano_y = image_y + (min_y * self.zoom)
+
+                painter.setOpacity(0.8)
+                painter.drawPixmap(int(pano_x), int(pano_y), pix_p)
                 painter.setOpacity(1.0)
-            except Exception:
-                pass
+            except Exception as e:
+                print("Error drawing panorama overlay:", e)
 
         # --- dibujar polímeros detectados ---
         for poly in self.model.polymers:
             # draw mask as semi-transparent overlay
             mask = poly.get('mask')
-            if mask is None:
-                continue
-            # convert mask to QImage
-            try:
-                h, w = mask.shape
-                img = (mask.astype('uint8') * 255).astype('uint8')
-                qimg_m = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
-                pix_m = QPixmap.fromImage(qimg_m)
-                pix_m = pix_m.scaled(pix.width(), pix.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                painter.setOpacity(0.25)
-                painter.drawPixmap(int(image_x), int(image_y), pix_m)
-                painter.setOpacity(1.0)
-            except Exception:
-                pass
+            if mask is not None:
+                try:
+                    h, w = mask.shape
+                    img_data = np.ascontiguousarray((mask.astype('uint8') * 255))
+                    qimg_m = QImage(img_data.data, w, h, w, QImage.Format_Grayscale8)
+                    pix_m = QPixmap.fromImage(qimg_m)
+                    pix_m = pix_m.scaled(pix.width(), pix.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    painter.setOpacity(0.3)
+                    painter.drawPixmap(int(image_x), int(image_y), pix_m)
+                    painter.setOpacity(1.0)
+                except Exception:
+                    pass
+
             # draw centerline
-            for i in range(len(poly.get('centerline', [])) - 1):
-                x0, y0 = poly['centerline'][i]
-                x1, y1 = poly['centerline'][i+1]
-                cx0 = x0 * self.zoom + image_x
-                cy0 = y0 * self.zoom + image_y
-                cx1 = x1 * self.zoom + image_x
-                cy1 = y1 * self.zoom + image_y
+            cline = poly.get('centerline', [])
+            if len(cline) >= 2:
                 pen = QPen(self.polymer_color)
                 pen.setWidth(2)
                 painter.setPen(pen)
-                painter.drawLine(int(cx0), int(cy0), int(cx1), int(cy1))
+                for i in range(len(cline) - 1):
+                    x0, y0 = cline[i]
+                    x1, y1 = cline[i+1]
+                    cx0 = x0 * self.zoom + image_x
+                    cy0 = y0 * self.zoom + image_y
+                    cx1 = x1 * self.zoom + image_x
+                    cy1 = y1 * self.zoom + image_y
+                    painter.drawLine(int(cx0), int(cy0), int(cx1), int(cy1))
+
+            # draw tag text near centroid
+            centroid = poly.get('centroid')
+            label_text = poly.get('label', '')
+            if centroid is not None and label_text:
+                cy, cx = centroid
+                tx = cx * self.zoom + image_x
+                ty = cy * self.zoom + image_y
+                painter.setPen(QPen(QColor(0, 229, 255)))
+                painter.drawText(int(tx) + 4, int(ty) - 4, str(label_text))
 
         # --- dibujar líneas manuales ---
-        for line in self.model.manual_lines:
-            self._draw_line(painter, line, self.manual_color)
+        for index, line in enumerate(self.model.manual_lines):
+            color = QColor(0, 200, 0) if index == self.selected_kymo_line_index else self.manual_color
+            self._draw_line(painter, line, color)
 
         # --- dibujar línea activa ---
         if self.active_line:
@@ -196,6 +226,7 @@ class KymoCanvas(QWidget):
         elif event.button() == Qt.RightButton:
             # start panning
             self._right_drag = True
+            self._right_drag_moved = False
             self._last_mouse_pos = event.position() if hasattr(event, 'position') else event.pos()
 
     def mouseMoveEvent(self, event):
@@ -203,6 +234,8 @@ class KymoCanvas(QWidget):
             pos = event.position() if hasattr(event, 'position') else event.pos()
             dx = pos.x() - self._last_mouse_pos.x()
             dy = pos.y() - self._last_mouse_pos.y()
+            if abs(dx) > 3 or abs(dy) > 3:
+                self._right_drag_moved = True
             self.pan_x += dx
             self.pan_y += dy
             self._last_mouse_pos = pos
@@ -222,6 +255,13 @@ class KymoCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.RightButton:
+            if not getattr(self, '_right_drag_moved', False):
+                # Simple right click (no drag): finish active profile if present
+                if self.active_line:
+                    if self.panel and hasattr(self.panel, 'finish_profile_from_canvas'):
+                        self.panel.finish_profile_from_canvas()
+                    elif self.panel and hasattr(self.panel, 'end_profile'):
+                        self.panel.end_profile()
             self._right_drag = False
             self._last_mouse_pos = None
             return

@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, simpledialog
+from pathlib import Path
 
 from kymo_manager import KymoManager
 from utils import get_pixel_size_from_tiff
@@ -11,13 +12,17 @@ def main():
 
     file_paths = filedialog.askopenfilenames(
         title="Select kymographs",
-        filetypes=[("TIFF", "*.tif *.tiff"), ("All files", "*.*")]
+        filetypes=[
+            ("Kymographs", "*.tif *.tiff *.csv *.txt *.tsv"),
+            ("All files", "*.*"),
+        ]
     )
     if not file_paths:
         print("No files selected.")
         return
 
-    pixel_size = get_pixel_size_from_tiff(file_paths[0])  # nm/pixel
+    is_tiff = Path(file_paths[0]).suffix.lower() in {".tif", ".tiff"}
+    pixel_size = get_pixel_size_from_tiff(file_paths[0]) if is_tiff else None
 
     if pixel_size is None:
         ans = simpledialog.askstring(

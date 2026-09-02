@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+from math import floor, ceil
 from scipy.ndimage import shift as nd_shift
 
 # ============================================================
@@ -164,69 +165,180 @@ def ecc_align_first_sequential(frames, mask_frames):
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-        masks_out[-1] = aligned_mask
+        masks_out.append(aligned_mask)
 
         ref_canvas = aligned_img.copy()
 
     return np.array(aligned), np.array(masks_out), transforms, H_pad, W_pad
 
-def drift_template_matching(ref, img, template_size=64):
+
+# ============================================================
+#                   TEMPLATE MATCHING UTILITIES
+# ============================================================
+
+def find_best_template(ref, template_size=64, margin=20):
+    """
+    Finds a square region of size `template_size` in `ref` (away from borders)
+    that has the highest standard deviation (maximum feature contrast).
+    Returns (template, top_left_y, top_left_x).
+    """
     H, W = ref.shape
-    cy, cx = H // 2, W // 2
     half = template_size // 2
 
-    template = ref[cy-half:cy+half, cx-half:cx+half].astype(np.float32)
+    y_min = margin + half
+    y_max = H - margin - half
+    x_min = margin + half
+    x_max = W - margin - half
 
-    res = cv2.matchTemplate(img.astype(np.float32), template, cv2.TM_CCOEFF_NORMED)
+    if y_max <= y_min or x_max <= x_min:
+        cy, cx = H // 2, W // 2
+        top_y, top_x = max(0, cy - half), max(0, cx - half)
+        return ref[top_y:top_y+template_size, top_x:top_x+template_size].astype(np.float32), top_y, top_x
+
+    best_std = -1.0
+    best_y, best_x = H // 2 - half, W // 2 - half
+
+    step = max(1, template_size // 4)
+    for y in range(y_min, y_max + 1, step):
+        for x in range(x_min, x_max + 1, step):
+            patch = ref[y-half:y+half, x-half:x+half]
+            std = np.std(patch)
+            if std > best_std:
+                best_std = std
+                best_y = y - half
+                best_x = x - half
+
+    template = ref[best_y:best_y+template_size, best_x:best_x+template_size].astype(np.float32)
+    return template, best_y, best_x
+
+
+def match_template_in_window(img, template, ref_y0, ref_x0, exp_dy=0.0, exp_dx=0.0, search_radius=80):
+    """
+    Matches `template` (extracted from `ref` at top-left `(ref_y0, ref_x0)`) inside `img`,
+    constraining the search window around the expected position `(ref_y0 + exp_dy, ref_x0 + exp_dx)`.
+    Applies 2nd-order quadratic subpixel refinement at the peak.
+    Returns (dy, dx, max_val).
+    """
+    H, W = img.shape
+    t_h, t_w = template.shape
+
+    exp_y0 = ref_y0 + exp_dy
+    exp_x0 = ref_x0 + exp_dx
+
+    search_y0 = int(max(0, floor(exp_y0 - search_radius)))
+    search_y1 = int(min(H, ceil(exp_y0 + t_h + search_radius)))
+    search_x0 = int(max(0, floor(exp_x0 - search_radius)))
+    search_x1 = int(min(W, ceil(exp_x0 + t_w + search_radius)))
+
+    if (search_y1 - search_y0) < t_h or (search_x1 - search_x0) < t_w:
+        search_y0, search_y1 = 0, H
+        search_x0, search_x1 = 0, W
+
+    crop = img[search_y0:search_y1, search_x0:search_x1].astype(np.float32)
+    if crop.shape[0] < t_h or crop.shape[1] < t_w:
+        crop = img.astype(np.float32)
+        search_y0, search_x0 = 0, 0
+
+    res = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
-    y, x = max_loc
+    match_x, match_y = max_loc
 
-    dy = y - (cy - half)
-    dx = x - (cx - half)
+    # Quadratic subpixel refinement
+    delta_x = 0.0
+    delta_y = 0.0
+    if 0 < match_y < res.shape[0] - 1 and 0 < match_x < res.shape[1] - 1:
+        y_m1 = float(res[match_y, match_x - 1])
+        y_0  = float(res[match_y, match_x])
+        y_p1 = float(res[match_y, match_x + 1])
+        denom_x = y_m1 - 2.0 * y_0 + y_p1
+        if abs(denom_x) > 1e-7:
+            delta_x = (y_m1 - y_p1) / (2.0 * denom_x)
+            delta_x = max(-0.5, min(0.5, delta_x))
 
-    return dy, dx, max_val
+        x_m1 = float(res[match_y - 1, match_x])
+        x_0  = float(res[match_y, match_x])
+        x_p1 = float(res[match_y + 1, match_x])
+        denom_y = x_m1 - 2.0 * x_0 + x_p1
+        if abs(denom_y) > 1e-7:
+            delta_y = (x_m1 - x_p1) / (2.0 * denom_y)
+            delta_y = max(-0.5, min(0.5, delta_y))
+
+    found_y0 = search_y0 + match_y + delta_y
+    found_x0 = search_x0 + match_x + delta_x
+
+    dy = found_y0 - ref_y0
+    dx = found_x0 - ref_x0
+
+    return dy, dx, float(max_val)
+
+
+def drift_template_matching(ref, img, template_size=64):
+    template, ref_y0, ref_x0 = find_best_template(ref, template_size=template_size)
+    return match_template_in_window(img, template, ref_y0, ref_x0, search_radius=80)
 
 
 def template_matching_sequential(frames, template_size=64):
-    ref = blur_frame(frames[0])
     drifts = [[0.0, 0.0]]
     confidence = [1.0]
 
     for i in range(1, len(frames)):
-        img = blur_frame(frames[i])
-        dy, dx, score = drift_template_matching(ref, img, template_size)
-        drifts.append([dy + drifts[-1][0], dx + drifts[-1][1]])
-        confidence.append(score)
+        img_prev = blur_frame(frames[i-1])
+        img_curr = blur_frame(frames[i])
 
-        # Update reference to aligned frame
-        ref = nd_shift(img, shift=(-dy, -dx), mode="constant", cval=0)
+        template, prev_y0, prev_x0 = find_best_template(img_prev, template_size=template_size)
+        step_dy, step_dx, score = match_template_in_window(
+            img_curr, template, prev_y0, prev_x0, exp_dy=0.0, exp_dx=0.0, search_radius=40
+        )
+
+        # Sanity check: reject extreme single-frame jumps (>25px)
+        if score < 0.15 or abs(step_dy) > 25 or abs(step_dx) > 25:
+            step_dy, step_dx = 0.0, 0.0
+            score = max(0.01, score)
+
+        total_dy = drifts[-1][0] + step_dy
+        total_dx = drifts[-1][1] + step_dx
+
+        drifts.append([total_dy, total_dx])
+        confidence.append(score)
 
     return np.array(drifts), np.array(confidence)
 
+
 # ============================================================
-#                   TEMPLATE MATCHING — SEQUENTIAL
+#                   TEMPLATE MATCHING — GLOBAL
 # ============================================================
 def pick_best_reference(frames, max_idx=20):
     scores = []
     limit = min(max_idx, len(frames)-1)
     for i in range(limit):
         scores.append((np.std(frames[i]), i))
-    # elegir el frame con mayor contraste
     _, best_idx = max(scores)
     return best_idx
+
 
 def template_matching_global(frames, template_size=64):
     # Keep frame 0 as the reference so drift coordinates match the stack.
     ref = blur_frame(frames[0])
+    template, ref_y0, ref_x0 = find_best_template(ref, template_size=template_size)
 
     drifts = [[0.0, 0.0]]
     confidence = [1.0]
 
+    last_dy, last_dx = 0.0, 0.0
+
     for i in range(1, len(frames)):
         img = blur_frame(frames[i])
-        dy, dx, score = drift_template_matching(ref, img, template_size)
+        dy, dx, score = match_template_in_window(
+            img, template, ref_y0, ref_x0, exp_dy=last_dy, exp_dx=last_dx, search_radius=80
+        )
+
+        if score < 0.15 or abs(dy - last_dy) > 40 or abs(dx - last_dx) > 40:
+            dy, dx = last_dy, last_dx
+            score = max(0.01, score)
+
         drifts.append([dy, dx])
         confidence.append(score)
+        last_dy, last_dx = dy, dx
 
     return np.array(drifts), np.array(confidence)
 def sample_mask_otsu(frame):
@@ -273,17 +385,8 @@ def clean_mask(mask):
 #     return np.array([dy, dx])
 
 def compute_raw_drift(frames, template_size=64):
-    ref = frames[0]
-    drifts = []
-
-    for i in range(len(frames)):
-        if i == 0:
-            drifts.append([0.0, 0.0])
-        else:
-            dy, dx = drift_template_matching(ref, frames[i], template_size)
-            drifts.append([dy, dx])
-
-    return np.array(drifts)
+    drifts, _ = template_matching_global(frames, template_size=template_size)
+    return drifts
 def align_with_auto_canvas(frames, drifts):
     H, W = frames[0].shape
     H_pad, W_pad, top, left = compute_optimal_canvas(frames, drifts)
@@ -320,9 +423,11 @@ def crop_to_used_area(aligned, masks):
     """
     Crop unused padding while preserving all pixels required by any frame.
     """
-    combined = np.sum(masks, axis=0)
+    combined = np.any(np.asarray(masks, dtype=bool), axis=0)
 
-    ys, xs = np.where(combined > 0)
+    ys, xs = np.where(combined)
+    if len(ys) == 0:
+        raise ValueError("Masks do not contain any valid video pixels")
     y_min, y_max = ys.min(), ys.max()
     x_min, x_max = xs.min(), xs.max()
 
@@ -379,22 +484,24 @@ def compute_optimal_canvas(frames, drifts):
     Calculate the smallest canvas containing all translated frames.
     This removes unused padding and keeps only what is required.
     """
-    H, W = frames[0].shape
+    frames = np.asarray(frames)
+    drifts = np.asarray(drifts, dtype=float)
+    if frames.ndim != 3 or frames.shape[0] == 0:
+        raise ValueError("Frames must be a non-empty grayscale stack")
+    if drifts.shape != (len(frames), 2) or not np.isfinite(drifts).all():
+        raise ValueError("Drifts must contain one finite (dy, dx) pair per frame")
+
+    H, W = frames.shape[1:]
 
     dy = drifts[:, 0]
     dx = drifts[:, 1]
 
-    # Minimum and maximum coordinates occupied by any frame.
-    y_min = dy.min()
-    y_max = dy.max()
-    x_min = dx.min()
-    x_max = dx.max()
-
-    # Alignment applies the inverse drift, so calculate bounds for -drift.
-    top    = int(max(0,  y_max))
-    bottom = int(max(0, -y_min))
-    left   = int(max(0,  x_max))
-    right  = int(max(0, -x_min))
+    # Alignment applies -drift. Round outward so sub-pixel shifts cannot clip
+    # an edge, then crop the union of valid masks after alignment.
+    top = int(np.ceil(max(0.0, dy.max())))
+    bottom = int(np.ceil(max(0.0, -dy.min())))
+    left = int(np.ceil(max(0.0, dx.max())))
+    right = int(np.ceil(max(0.0, -dx.min())))
 
     H_pad = H + top + bottom
     W_pad = W + left + right
@@ -417,8 +524,17 @@ def ecc_align_final(frames, mask_frames):
 
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-6)
 
+    # Sanity check: mask_frames must exist, have the same length, and same frame shape
+    if (mask_frames is None or len(mask_frames) != len(frames) or
+            getattr(mask_frames[0], 'shape', None) != (H_pad, W_pad)):
+        mask_frames = np.ones((len(frames), H_pad, W_pad), dtype=np.uint8)
+
+    first_mask = np.asarray(mask_frames[0], dtype=np.uint8)
+    if first_mask.shape != (H_pad, W_pad):
+        first_mask = cv2.resize(first_mask, (W_pad, H_pad), interpolation=cv2.INTER_NEAREST)
+
     aligned = [ref_canvas.copy()]
-    masks_out = [mask_frames[0].astype(np.uint8)]
+    masks_out = [first_mask]
     ecc_transforms = [warp_matrix.copy()]
 
     for i in range(1, len(frames)):
@@ -439,7 +555,10 @@ def ecc_align_final(frames, mask_frames):
             borderValue=0
         )
 
-        mask_i = mask_frames[i].astype(np.uint8)
+        mask_i = np.asarray(mask_frames[i], dtype=np.uint8)
+        if mask_i.shape != (H_pad, W_pad):
+            mask_i = cv2.resize(mask_i, (W_pad, H_pad), interpolation=cv2.INTER_NEAREST)
+
         aligned_mask = cv2.warpAffine(
             mask_i, frame_warp, (W_pad, H_pad),
             flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP,

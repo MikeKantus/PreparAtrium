@@ -64,6 +64,42 @@ except Exception:
 from core.kymo_tools import extract_kymograph
 
 
+def _order_centerline_points(coords_yx):
+    """Sort centerline coordinates (y, x) sequentially along the skeleton curve."""
+    if len(coords_yx) == 0:
+        return []
+    if len(coords_yx) <= 2:
+        return [(int(x), int(y)) for y, x in coords_yx]
+
+    pts = np.column_stack((coords_yx[:, 1], coords_yx[:, 0])).astype(float)
+    n = len(pts)
+
+    centroid = pts.mean(axis=0)
+    dists_from_center = np.linalg.norm(pts - centroid, axis=1)
+    start_idx = np.argmax(dists_from_center)
+
+    ordered = [pts[start_idx]]
+    mask = np.ones(n, dtype=bool)
+    mask[start_idx] = False
+
+    curr_pt = pts[start_idx]
+    while np.any(mask):
+        rem_indices = np.where(mask)[0]
+        rem_pts = pts[rem_indices]
+        dists = np.linalg.norm(rem_pts - curr_pt, axis=1)
+        nearest_rel = np.argmin(dists)
+        nearest_idx = rem_indices[nearest_rel]
+
+        if dists[nearest_rel] > 15.0:
+            break
+
+        curr_pt = pts[nearest_idx]
+        ordered.append(curr_pt)
+        mask[nearest_idx] = False
+
+    return [(int(p[0]), int(p[1])) for p in ordered]
+
+
 class KymoModel:
     """
     Modelo científico para el panel de kymogramas.
@@ -77,7 +113,7 @@ class KymoModel:
         stack : np.ndarray
             Vídeo final ECC (frames, height, width)
         meta : dict
-            Metadatos extendidos (pixel_size_nm, frame_rate, drift, ecc_transforms…)
+            Metadatos extendidos (pixel_size_nm, real_fps, drift, ecc_transforms…)
         """
         self.stack = np.asarray(stack)
         self.meta = dict(meta) if meta is not None else {}
@@ -118,14 +154,14 @@ class KymoModel:
         )
 
     @property
-    def frame_rate(self):
+    def real_fps(self):
         """
         Devuelve la frecuencia de adquisición (frames/s).
         """
         return (
             self.meta.get("real_fps")
             or self.meta.get("fps")
-            or self.meta.get("frame_rate")
+            or self.meta.get("frame_rate_fps")
         )
 
     @property
@@ -133,7 +169,7 @@ class KymoModel:
         """
         Devuelve el tiempo entre frames en segundos.
         """
-        fr = self.frame_rate
+        fr = self.real_fps
         return 1.0 / fr if fr else None
 
     @property
@@ -186,26 +222,50 @@ class KymoModel:
         self.polymers = []
         self.centerlines = [list(line) for line in self.manual_lines]
 
-    def detect_polymers(self, min_size_px=50, elongation_thresh=2.0):
-        """Detect candidate tubular polymers in the first frame using Otsu thresholding + morphology.
+    def detect_polymers(self, min_size_px=50, elongation_thresh=2.0, sigma=1.0,
+                        threshold_method="Otsu", sensitivity=1.0, frame_idx=None):
+        """Detect candidate tubular polymers using filtering, thresholding + morphology.
 
-        Results are stored in self.polymers as dicts with keys: mask, label, bbox, centroid, centerline (approx).
+        Results are stored in self.polymers as dicts with keys: mask, label, bbox, centroid, centerline.
         """
-        img = self.stack[0].astype(np.float32)
+        if frame_idx is None:
+            frame_idx = getattr(self, "current_frame", 0)
+        frame_idx = max(0, min(self.n_frames - 1, frame_idx))
+        raw_img = self.stack[frame_idx].astype(np.float32)
+
         # Normalizar
-        img = img - np.nanmin(img)
+        img = raw_img - np.nanmin(raw_img)
         if np.nanmax(img) > 0:
             img = img / np.nanmax(img)
 
-        # Threshold (Otsu)
-        try:
-            th = filters.threshold_otsu(img)
-        except Exception:
-            th = np.percentile(img[~np.isnan(img)], 90)
-        mask = img >= th
+        # 1. Filtro Gaussiano para suavizar ruido
+        if sigma > 0:
+            if _HAS_SKIMAGE:
+                filtered_img = filters.gaussian(img, sigma=sigma)
+            else:
+                filtered_img = ndimage.gaussian_filter(img, sigma=sigma)
+        else:
+            filtered_img = img
 
-        # Morphological cleaning
-        mask = morphology.remove_small_objects(mask, min_size=10)
+        # 2. Umbralización (Thresholding)
+        if threshold_method == "Percentil":
+            perc = max(10.0, min(99.0, 90.0 / max(0.1, sensitivity)))
+            th = np.percentile(filtered_img[~np.isnan(filtered_img)], perc)
+        else:  # "Otsu"
+            try:
+                if _HAS_SKIMAGE:
+                    base_th = filters.threshold_otsu(filtered_img)
+                else:
+                    base_th = np.percentile(filtered_img[~np.isnan(filtered_img)], 90)
+            except Exception:
+                base_th = np.percentile(filtered_img[~np.isnan(filtered_img)], 90)
+            th = base_th / max(0.1, sensitivity)
+
+        mask = filtered_img >= th
+
+        # 3. Limpieza morfológica
+        min_obj_size = max(1, int(min_size_px // 4))
+        mask = morphology.remove_small_objects(mask, min_size=min_obj_size)
         mask = morphology.binary_closing(mask, morphology.disk(3))
         mask = ndimage.binary_fill_holes(mask)
 
@@ -216,9 +276,10 @@ class KymoModel:
         for i, prop in enumerate(props, start=1):
             if prop.area < min_size_px:
                 continue
-            # elongation approximate: area / (minor_axis_length^2)
-            if hasattr(prop, 'minor_axis_length') and prop.minor_axis_length > 0:
-                elong = max(prop.major_axis_length / (prop.minor_axis_length + 1e-6), 1.0)
+            minor_len = getattr(prop, 'axis_minor_length', getattr(prop, 'minor_axis_length', None))
+            major_len = getattr(prop, 'axis_major_length', getattr(prop, 'major_axis_length', None))
+            if minor_len is not None and minor_len > 0 and major_len is not None:
+                elong = max(major_len / (minor_len + 1e-6), 1.0)
             else:
                 elong = 1.0
             if elong < elongation_thresh:
@@ -230,26 +291,25 @@ class KymoModel:
                 'bbox': prop.bbox,
                 'centroid': prop.centroid,
                 'area': prop.area,
-                'major_axis_length': getattr(prop, 'major_axis_length', None),
-                'minor_axis_length': getattr(prop, 'minor_axis_length', None),
+                'major_axis_length': major_len,
+                'minor_axis_length': minor_len,
             }
-            # Simple centerline: skeletonize mask and extract coordinates
+            # Skeletonize mask and order coordinates
             try:
                 if _HAS_SKIMAGE:
                     skel = morphology.skeletonize(p['mask'])
                 else:
-                    # crude skeleton via medial axis approximation
                     skel = ndimage.distance_transform_edt(p['mask']) > 0
-                coords = np.column_stack(np.where(skel))  # (y, x)
-                # convert to (x,y)
-                centerline = [(int(x), int(y)) for y, x in coords]
+                coords = np.column_stack(np.where(skel))
+                centerline = _order_centerline_points(coords)
             except Exception:
                 centerline = []
 
             p['centerline'] = centerline
             self.polymers.append(p)
-        # cache invalidation for panorama if polymers affect it
+
         self._panorama_cache = None
+        return self.polymers
 
     # ============================================================
     #                   KYMOGRAMAS
@@ -271,10 +331,10 @@ class KymoModel:
         # Ensure pixel size (nm / pixel) is present
         meta_for_call.setdefault("pixel_size", self.pixel_size_nm)
         meta_for_call.setdefault("pixel_size_nm", self.pixel_size_nm)
-        # Ensure frame_rate presence if available
-        if self.frame_rate is not None:
-            meta_for_call.setdefault("frame_rate", self.frame_rate)
-            meta_for_call.setdefault("real_fps", self.frame_rate)
+        # Ensure real_fps presence if available
+        if self.real_fps is not None:
+            meta_for_call.setdefault("real_fps", self.real_fps)
+            meta_for_call.setdefault("real_fps", self.real_fps)
 
         # Call extractor with guaranteed metadata
         kymo, axis_x_nm, axis_t_s = extract_kymograph(
@@ -323,6 +383,8 @@ class KymoModel:
                 pano = np.nanmax(self.stack, axis=0)
             else:
                 pano = np.nanmean(self.stack, axis=0)
+            self._pano_min_x = 0
+            self._pano_min_y = 0
             self._panorama_cache = pano
             return pano
 
@@ -334,10 +396,13 @@ class KymoModel:
         max_x = int(max(0, max(xs)))
         max_y = int(max(0, max(ys)))
 
+        self._pano_min_x = min_x
+        self._pano_min_y = min_y
+
         canvas_w = W + (max_x - min_x)
         canvas_h = H + (max_y - min_y)
 
-        canvas = np.full((canvas_h, canvas_w), np.nan, dtype=self.stack.dtype)
+        canvas = np.full((canvas_h, canvas_w), np.nan, dtype=np.float64)
 
         for i, frame in enumerate(self.stack):
             ox, oy = offsets[i]
@@ -429,7 +494,7 @@ class KymoModel:
         }
 
         entry["pixel_size_nm"] = self.pixel_size_nm
-        entry["fps"] = self.frame_rate
+        entry["fps"] = self.real_fps
         entry["time_per_frame_s"] = self.time_per_frame
 
         self.kymos.append(entry)
@@ -454,7 +519,7 @@ class KymoModel:
         # JSON
         meta_out = {
             "pixel_size_nm": self.pixel_size_nm,
-            "frame_rate_fps": self.frame_rate,
+            "fps": self.real_fps,
             "axis_x_nm": entry["axis_x_nm"].tolist(),
             "axis_t_s": entry["axis_t_s"].tolist(),
             "line_points": entry["line"]
