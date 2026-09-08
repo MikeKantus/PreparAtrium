@@ -1,3 +1,5 @@
+# gui/main.py
+
 import tkinter as tk
 from tkinter import filedialog, simpledialog
 from pathlib import Path

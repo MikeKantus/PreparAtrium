@@ -1,4 +1,5 @@
-# kymo_model.py
+# gui/kymo_model.py
+# Scientific model for handling kymograph data, including centerline extraction, polymer detection, and kymograph generation.
 import numpy as np
 import json
 from scipy import ndimage

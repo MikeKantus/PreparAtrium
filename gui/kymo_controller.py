@@ -1,3 +1,5 @@
+# gui/kymo_controller.py
+# Controller for handling kymograph data, including loading, smoothing, and visualization.
 import numpy as np
 from scipy.ndimage import gaussian_filter, median_filter
 from skimage.filters import threshold_otsu

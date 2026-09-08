@@ -1,6 +1,8 @@
 #gui/drift_panel.py
+import json
 import sys
 import time
+from pathlib import Path
 from PIL import Image
 import numpy as np
 import cv2
@@ -10,7 +12,7 @@ import io
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout,
     QFileDialog, QHBoxLayout, QSlider, QProgressBar,
-    QGridLayout, QDialog, QSizePolicy, QSizePolicy
+    QGridLayout, QDialog, QSizePolicy, QSizePolicy, QCheckBox, QComboBox
 )
 from PySide6.QtGui import QPixmap, QImage
 from PySide6.QtCore import Qt
@@ -18,6 +20,7 @@ from PySide6.QtCore import Qt
 from scipy.ndimage import shift as nd_shift
 
 from core.ui_utils import frame_to_qimage_safe
+from core.video_annotations import annotate_frame
 from core.drift_tools import (
     sample_mask_otsu,
     clean_mask,
@@ -168,6 +171,20 @@ class DriftWindow(QWidget):
         self.btn_discard_preview = QPushButton("Discard preview")
         self.btn_save_fine_ecc = QPushButton("Save aligned Fine ECC video")
         self.btn_open_kymo = QPushButton("Open Kymograph Panel")
+        self.checkbox_overlay = QCheckBox("Overlay timestamp (s)")
+        self.checkbox_overlay_frame = QCheckBox("Overlay frame #")
+        self.combo_overlay_text_size = QComboBox()
+        self.combo_overlay_text_size.addItems(["Small", "Medium", "Large"])
+        self.combo_overlay_text_size.setCurrentText("Medium")
+        self.combo_overlay_text_color = QComboBox()
+        self.combo_overlay_text_color.addItems(["White", "Black", "Yellow", "Cyan", "Red"])
+        self.combo_overlay_text_color.setCurrentText("White")
+        self.checkbox_scale_bar = QCheckBox("Scale bar (1/5 width)")
+        self.combo_scale_bar_color = QComboBox()
+        self.combo_scale_bar_color.addItems(["White", "Black", "Yellow", "Cyan", "Red"])
+        self.combo_scale_bar_color.setCurrentText("White")
+        self.combo_color_palette = QComboBox()
+        self.combo_color_palette.addItems(["Grayscale", "Viridis", "Plasma", "Turbo", "Hot"])
 
         # STATUS
         self.progress = QProgressBar()
@@ -293,6 +310,19 @@ class DriftWindow(QWidget):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             controls_grid.addWidget(button, index // 2, index % 2)
         controls_layout.addLayout(controls_grid)
+        annotation_layout = QGridLayout()
+        annotation_layout.addWidget(self.checkbox_overlay, 0, 0)
+        annotation_layout.addWidget(self.checkbox_overlay_frame, 0, 1)
+        annotation_layout.addWidget(QLabel("Text size"), 1, 0)
+        annotation_layout.addWidget(self.combo_overlay_text_size, 1, 1)
+        annotation_layout.addWidget(QLabel("Text color"), 2, 0)
+        annotation_layout.addWidget(self.combo_overlay_text_color, 2, 1)
+        annotation_layout.addWidget(self.checkbox_scale_bar, 3, 0, 1, 2)
+        annotation_layout.addWidget(QLabel("Scale bar color"), 4, 0)
+        annotation_layout.addWidget(self.combo_scale_bar_color, 4, 1)
+        annotation_layout.addWidget(QLabel("Video palette"), 5, 0)
+        annotation_layout.addWidget(self.combo_color_palette, 5, 1)
+        controls_layout.addLayout(annotation_layout)
         controls_layout.addStretch()
         grid.addWidget(panel_C1, 1, 0)
 
@@ -347,29 +377,64 @@ class DriftWindow(QWidget):
         self.btn_discard_preview.clicked.connect(self.discard_preview)
         self.btn_save_fine_ecc.clicked.connect(self.save_fine_aligned_video)
         self.btn_open_kymo.clicked.connect(self.open_kymo_panel)
+        for control in (self.checkbox_overlay, self.checkbox_overlay_frame, self.checkbox_scale_bar):
+            control.toggled.connect(self._refresh_annotation_previews)
+        self.combo_overlay_text_size.currentTextChanged.connect(self._refresh_annotation_previews)
+        self.combo_overlay_text_color.currentTextChanged.connect(self._refresh_annotation_previews)
+        self.combo_scale_bar_color.currentTextChanged.connect(self._refresh_annotation_previews)
+        self.combo_color_palette.currentTextChanged.connect(self._refresh_annotation_previews)
 
 
         # ============================================================
         #                   LOAD STACK IF PROVIDED
         # ============================================================
         if self.stack is not None:
-            self.frames = self.stack.copy()
-            self.original_frames = self.frames.copy()
-            self.current_stack = self.frames.copy()
-
-            self.slider_original.setMaximum(len(self.frames) - 1)
-            self.slider_current.setMaximum(len(self.current_stack) - 1)
-            self.trim_start.setMaximum(len(self.frames) - 1)
-            self.trim_end.setMaximum(len(self.frames) - 1)
-            self.trim_end.setValue(len(self.frames) - 1)
-
-            self.update_original_frame(0)
-            self.update_current_frame(0)
-            self.status_label.setText(f"Video loaded from AFMLoader: {len(self.frames)} frames")
+            self.reset_and_load_stack(self.stack, self.meta)
 
     # ============================================================
     #                   VIDEO LOADING and DISPLAY
     # ============================================================
+
+    def reset_and_load_stack(self, stack, meta=None):
+        """Resets all internal drift state and loads a new stack."""
+        self.stack = np.asarray(stack).copy()
+        self.meta = dict(meta) if meta is not None else {}
+
+        self.frames = self.stack.copy()
+        self.original_frames = self.frames.copy()
+        self.current_stack = self.frames.copy()
+
+        # Clear all previews and calculated drift results
+        self.processed_stack = None
+        self.processed_masks = None
+        self.processed_drifts = None
+        self.tm_frames = None
+        self.tm_masks = None
+        self.tm_drifts = None
+        self.drift_frames = None
+        self.drift_masks = None
+        self.drift_drifts = None
+        self.initial_ecc_frame = None
+        self.initial_ecc_masks = None
+        self.ecc_frames = None
+        self.ecc_masks = None
+
+        self.slider_original.setMaximum(len(self.frames) - 1)
+        self.slider_current.setMaximum(len(self.current_stack) - 1)
+        self.slider_drift.setMaximum(0)
+        self.slider_fine_ecc.setMaximum(0)
+        self.slider_processed.setMaximum(0)
+
+        self.trim_start.setMaximum(len(self.frames) - 1)
+        self.trim_start.setValue(0)
+        self.trim_end.setMaximum(len(self.frames) - 1)
+        self.trim_end.setValue(len(self.frames) - 1)
+
+        self.update_original_frame(0)
+        self.update_current_frame(0)
+        self.label_processed.clear()
+        self.label_processed.setText("Processed stack not available")
+        self.status_label.setText(f"Video reset & loaded from AFMLoader: {len(self.frames)} frames")
 
     def open_kymo_panel(self):
         if self.current_stack is None:
@@ -457,14 +522,29 @@ class DriftWindow(QWidget):
         display = np.asarray(stack[idx]).copy()
         if mask_stack is not None and idx < len(mask_stack):
             display[np.asarray(mask_stack[idx]) == 0] = 255
-        try:
-            qimg = frame_to_qimage_safe(display)
-        except Exception:
-            qimg = numpy_to_qimage(display)
+        annotated = self._annotate_frame(display, idx)
+        rgb = np.ascontiguousarray(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg)
         pix = pix.scaled(max(1, label.width()), max(1, label.height()),
                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
         label.setPixmap(pix)
+
+    def _annotate_frame(self, frame, index):
+        return annotate_frame(
+            frame, index, self.meta,
+            show_timestamp=self.checkbox_overlay.isChecked(),
+            show_frame_number=self.checkbox_overlay_frame.isChecked(),
+            text_size=self.combo_overlay_text_size.currentText(),
+            text_color=self.combo_overlay_text_color.currentText(),
+            show_scale_bar=self.checkbox_scale_bar.isChecked(),
+            scale_bar_color=self.combo_scale_bar_color.currentText(),
+            color_palette=self.combo_color_palette.currentText(),
+        )
+
+    def _refresh_annotation_previews(self, *_):
+        self.update_current_frame()
+        self.update_processed_frame()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -671,6 +751,11 @@ class DriftWindow(QWidget):
         pipeline = DriftPipeline(self.current_stack)
 
         ecc_frames, ecc_masks, transforms, H_pad, W_pad = pipeline.run_ecc1_sequential()
+        try:
+            ecc_frames, ecc_masks = crop_to_used_area(ecc_frames, ecc_masks)
+        except ValueError:
+            self.status_label.setText("Sequential ECC produced no valid frame coverage")
+            return
 
         self.initial_ecc_frame = ecc_frames
         self.initial_ecc_masks = ecc_masks
@@ -1003,7 +1088,8 @@ class DriftWindow(QWidget):
         # Its masks are already in the same canvas and coordinate system.
         frames = self.current_stack
         masks = self.tm_masks if self.tm_masks is not None else None
-        if masks is None or len(masks) != len(frames):
+        if (masks is None or len(masks) != len(frames) or
+                getattr(masks[0], 'shape', None) != frames[0].shape):
             masks = np.ones_like(frames, dtype=np.uint8)
 
         ecc_frames, ecc_masks_raw, ecc_transforms = ecc_align_final(
@@ -1125,14 +1211,88 @@ class DriftWindow(QWidget):
         if not path:
             return
 
-        H, W = self.current_stack[0].shape
-        out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"XVID"), 20, (W, H), False)
+        frames = np.asarray(self.current_stack)
+        if frames.ndim != 3 or frames.shape[0] == 0:
+            self.status_label.setText("Current stack must contain grayscale frames")
+            return
 
-        for f in self.current_stack:
-            out.write(f.astype(np.uint8))
+        finite = np.isfinite(frames)
+        if not finite.any():
+            self.status_label.setText("Current stack has no finite pixel values")
+            return
 
-        out.release()
-        self.status_label.setText("Aligned video saved")
+        source_min = float(np.min(frames[finite]))
+        source_max = float(np.max(frames[finite]))
+        if frames.dtype == np.uint8:
+            frames_uint8 = frames
+        elif source_max > source_min:
+            frames_uint8 = np.clip(
+                (np.nan_to_num(frames, nan=source_min, posinf=source_max, neginf=source_min) - source_min)
+                * 255.0 / (source_max - source_min),
+                0,
+                255,
+            ).astype(np.uint8)
+        else:
+            frames_uint8 = np.zeros(frames.shape, dtype=np.uint8)
+
+        video_path = Path(path).with_suffix(".avi")
+        metadata_path = video_path.with_suffix(".json")
+        fps = float((self.meta or {}).get("fps") or (self.meta or {}).get("frame_rate") or 20.0)
+        height = int(frames_uint8.shape[1])
+        width = int(frames_uint8.shape[2])
+        writer = cv2.VideoWriter(
+            str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height), True
+        )
+        if not writer.isOpened():
+            self.status_label.setText("Could not open video writer for MJPEG AVI")
+            return
+
+        try:
+            for index, frame in enumerate(frames_uint8):
+                writer.write(self._annotate_frame(frame, index))
+        finally:
+            writer.release()
+
+        export_metadata = {
+            "source_metadata": self.meta or {},
+            "export": {
+                "video_file": video_path.name,
+                "codec": "MJPG",
+                "fps": fps,
+                "frame_count": int(frames_uint8.shape[0]),
+                "frame_width": int(width),
+                "frame_height": int(height),
+                "source_dtype": str(frames.dtype),
+                "source_intensity_min": source_min,
+                "source_intensity_max": source_max,
+                "annotations": {
+                    "timestamp": self.checkbox_overlay.isChecked(),
+                    "frame_number": self.checkbox_overlay_frame.isChecked(),
+                    "text_size": self.combo_overlay_text_size.currentText(),
+                    "text_color": self.combo_overlay_text_color.currentText(),
+                    "scale_bar": self.checkbox_scale_bar.isChecked(),
+                    "scale_bar_color": self.combo_scale_bar_color.currentText(),
+                    "color_palette": self.combo_color_palette.currentText(),
+                    "scale_bar_width_fraction": 0.2,
+                },
+            },
+        }
+        try:
+            with metadata_path.open("w", encoding="utf-8") as metadata_file:
+                json.dump(export_metadata, metadata_file, indent=2, default=self._json_default)
+        except (OSError, TypeError) as error:
+            self.status_label.setText(f"Video saved, but metadata failed: {error}")
+            return
+
+        self.status_label.setText(f"Aligned video and metadata saved: {video_path.name}")
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
     
 # ============================================================
 #                   MAIN ENTRY POINT

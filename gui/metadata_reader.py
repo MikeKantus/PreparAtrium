@@ -1,3 +1,5 @@
+# gui/metadata_reader.py
+# Reader for extracting metadata from JPK TIFF files.
 def read_metadata_jpk(path):
     """
     Lee metadatos de archivos JPK usando TIFF tags.

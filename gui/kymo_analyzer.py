@@ -1,3 +1,5 @@
+# gui/kymo_analyzer.py
+# Analyzer for handling kymograph data, including loading, smoothing, and visualization.
 import numpy as np
 import tifffile as tiff
 import matplotlib.patches as patches

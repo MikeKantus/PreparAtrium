@@ -1,3 +1,5 @@
+# gui/kymo_panel.py
+# Fixed-size Qt kymograph workspace backed by the MVC components.
 import threading
 import numpy as np
 from PySide6.QtCore import Qt, QTimer

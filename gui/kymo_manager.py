@@ -1,3 +1,5 @@
+# gui/kymo_manager.py
+# Manager for coordinating kymograph analysis, including file handling, in-memory kymos, and user interactions.
 import os
 import csv
 import numpy as np

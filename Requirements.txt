@@ -1,4 +1,4 @@
-upgrade pip
+pip
 PySide6
 numpy
 opencv-python
@@ -17,5 +17,7 @@ rich
 black
 flake8
 pytest
-nanolocz
 opencv-contrib-python
+AFMReader
+playNano
+tqdm

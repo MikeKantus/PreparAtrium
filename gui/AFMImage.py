@@ -1,3 +1,5 @@
+# gui/AFMImage.py
+# Class for loading and handling AFM image data from JPK/HDF5 files.
 import numpy as np
 import h5py
 import os

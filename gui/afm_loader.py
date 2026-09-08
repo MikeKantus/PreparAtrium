@@ -106,7 +106,29 @@ def _zero_baseline_per_frame(frames):
         if finite.any():
             frame[finite] -= np.min(frame[finite])
     return normalized
+def normalize_meta_with_aliases(meta, aliases):
+    normalized = {}
+    for key, alias_list in aliases.items():
+        for alias in alias_list:
+            if alias in meta:
+                normalized[key] = meta[alias]
+                break
+    return normalized
+def update_metadata_json(path, extra_meta, read_metadata_func):
+     # 1) Leer metadatos existentes (JSON o hardware)
+    base_meta = read_metadata_func(str(path))
 
+    # 2) Fusionar con los nuevos
+    merged = {**base_meta, **extra_meta}
+
+    # 3) Guardar JSON actualizado
+    try:
+        with open(json_path, "w") as f:
+            json.dump(merged, f, indent=4)
+    except Exception as e:
+        print("DEBUG: error writing merged metadata:", e)
+
+    return merged
 
 class AFMLoaderWidget(QWidget):
     def __init__(self, main_window=None):
@@ -317,8 +339,6 @@ class AFMLoaderWidget(QWidget):
 
         self.group_advanced = QGroupBox("Advanced Leveling / Flattening")
        
-
-
         # Now create the left_col layout and add the splitter and the leveling controls below
         left_col = QVBoxLayout()
         left_col.addWidget(self.left_splitter)
@@ -334,8 +354,6 @@ class AFMLoaderWidget(QWidget):
         self.current_stack = None
         self.processed_stack = None
 
-        
-        
         # --- Advanced Leveling / Flattening Controls ---
        
         layout_adv = QVBoxLayout()
@@ -550,68 +568,67 @@ class AFMLoaderWidget(QWidget):
             return
 
                 # --- ASD ---
+       # --- ASD ---
         asd_files = [f for f in os.listdir(path) if f.lower().endswith(".asd")]
         if asd_files:
             generated_tiffs = []
+
             for fname in asd_files:
                 full = os.path.join(path, fname)
                 base = os.path.splitext(full)[0]
                 out_json = base + ".json"
 
-                # Si existe JSON, comprobar si faltan TIFF
-                if os.path.exists(out_json):
-                    try:
-                        with open(out_json, "r") as f:
-                            meta_json = json.load(f)
-                        expected_frames = meta_json.get("num_imgs", None)
-                    except Exception:
-                        expected_frames = None
-
-                    tiffs = sorted([
-                        os.path.join(path, f)
-                        for f in os.listdir(path)
-                        if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")
-                    ])
-
-                    if tiffs and (expected_frames is None or len(tiffs) == expected_frames):
-                        generated_tiffs.extend(tiffs)
-                        continue
-
-                # Cargar ASD
-                result = load_asd(full, channel="TP")
-                # Desempaquetado correcto para tu loader
+                # ------------------------------------------------------------
+                # 1) Leer SOLO el header del ASD para obtener num_frames
+                #    (sin cargar los frames → carga instantánea)
+                # ------------------------------------------------------------
                 try:
-                    frames = result[0]
-                    meta   = result[2]   # ← el diccionario está aquí
+                    header_only = load_asd(full, channel="TP", read_frames=False)
+                    header_meta = header_only[2] if isinstance(header_only, (list, tuple)) else {}
+                    num_frames = header_meta.get("num_frames")
                 except Exception:
-                    raise ValueError(f"ASD loader returned unexpected structure: {result}")
-                # --- Normalización de metadatos ---
+                    num_frames = None
+
+                # ------------------------------------------------------------
+                # 2) Comprobar si ya existen TIFFs y JSON
+                # ------------------------------------------------------------
+                tiffs = sorted([
+                    os.path.join(path, f)
+                    for f in os.listdir(path)
+                    if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")
+                ])
+
+                if os.path.exists(out_json) and num_frames is not None and len(tiffs) == num_frames:
+                    # Ya está todo generado → usar TIFFs existentes
+                    generated_tiffs.extend(tiffs)
+                    continue
+
+                # ------------------------------------------------------------
+                # 3) Cargar ASD COMPLETO solo si faltan TIFFs
+                # ------------------------------------------------------------
+                result = load_asd(full, channel="TP")
+                frames = result[0]
+                meta   = result[2]
+
+                # 🔵 Normalizar metadatos usando alias del pipeline
+                meta = normalize_meta_with_aliases(meta, self.meta_aliases)
+
+                # 🔵 Completar metadatos faltantes
                 # FPS
-                if "frame_time" in meta:
-                    try:
+                if "real_fps" not in meta:
+                    if "frame_time" in meta:
                         meta["real_fps"] = 1000.0 / float(meta["frame_time"])
-                    except Exception:
-                        meta["real_fps"] = None
-
-                elif "frame_time_ms" in meta:
-                    try:
+                    elif "frame_time_ms" in meta:
                         meta["real_fps"] = 1000.0 / float(meta["frame_time_ms"])
-                    except Exception:
-                        meta["real_fps"] = None
-
-                elif "frame_time_s" in meta:
-                    try:
+                    elif "frame_time_s" in meta:
                         meta["real_fps"] = 1.0 / float(meta["frame_time_s"])
-                    except Exception:
-                        meta["real_fps"] = None
-
-                elif "fps" in meta:
-                    meta["real_fps"] = float(meta["fps"])
+                    elif "fps" in meta:
+                        meta["real_fps"] = float(meta["fps"])
 
                 # Rango X/Y
-                if "x_nm" in meta:
+                if "x_range_nm" not in meta and "x_nm" in meta:
                     meta["x_range_nm"] = float(meta["x_nm"])
-                if "y_nm" in meta:
+                if "y_range_nm" not in meta and "y_nm" in meta:
                     meta["y_range_nm"] = float(meta["y_nm"])
 
                 # Pixel size
@@ -627,19 +644,27 @@ class AFMLoaderWidget(QWidget):
                 if frames.ndim == 2:
                     frames = frames[np.newaxis, ...]
 
-                # Guardar TIFFs
+                # ------------------------------------------------------------
+                # 4) Guardar TIFFs
+                # ------------------------------------------------------------
                 for i, frame in enumerate(frames):
                     tif_path = f"{base}_frame{i:04d}.tif"
                     tifffile.imwrite(tif_path, frame.astype(np.float32))
                     generated_tiffs.append(tif_path)
 
-                # Guardar JSON
+                # ------------------------------------------------------------
+                # 5) Guardar JSON global
+                # ------------------------------------------------------------
                 with open(out_json, "w") as f:
                     json.dump(meta, f, indent=2)
 
+            # ------------------------------------------------------------
+            # 6) Mostrar TIFFs en el panel
+            # ------------------------------------------------------------
             self._populate_from_file_list(generated_tiffs)
             self.status_label.setText(f"Preview folder: {os.path.basename(path)}")
             return
+
 
 
         # 3) STP
@@ -705,6 +730,7 @@ class AFMLoaderWidget(QWidget):
             self._populate_from_file_list(tif_files)
 
         self.status_label.setText(f"Preview folder: {os.path.basename(path)}")
+
 
     def enter_folder(self, item):
         path = item.data(Qt.UserRole)
@@ -878,7 +904,8 @@ class AFMLoaderWidget(QWidget):
             f"Found {len(self._file_index)} files. Select one or more to build the video."
         )
 
-
+  
+    
     def _read_metadata_jpk(self, path):
         """
         Lee metadatos de archivos JPK, ASD, STP/SPM y TIFF generados.
@@ -1098,7 +1125,30 @@ class AFMLoaderWidget(QWidget):
         else:
             # Fallback: read metadata from JPK
             meta = self._read_metadata_jpk(jpk_path)
+        filename = os.path.basename(path).lower()
 
+        if "uv_on" in filename:
+            uv_state = "ON"
+        elif "uv_off" in filename:
+            uv_state = "OFF"
+        else:
+            uv_state = None
+
+        extra_meta = {
+            "uv_state": uv_state,
+            "filename": filename,
+            "frame_index": frame_index,        # <-- IMPORTANTE: AFM Loader ya lo tiene
+        }
+
+        # Si es UV ON, guardamos el frame y el tiempo
+        if uv_state == "ON":
+            extra_meta["uv_on_frame"] = frame_index
+            extra_meta["uv_on_time_s"] = frame_index * time_per_frame
+
+        # ------------------------------------------------------------
+        # FUSIONAR METADATOS (hardware + custom) Y GUARDAR JSON
+        # ------------------------------------------------------------
+        merged_meta = update_metadata_json(path, extra_meta, self._read_metadata_jpk)
         meta = dict(meta or {})
         if os.path.isfile(jpk_path):
             meta["_source_format"] = "jpk"
@@ -1258,9 +1308,6 @@ class AFMLoaderWidget(QWidget):
                 cap.release()
 
                 return np.array(frames), {"source_file": p}
-
-            
-
         try:
 
             with h5py.File(p, "r") as f:
@@ -1355,18 +1402,42 @@ class AFMLoaderWidget(QWidget):
         except Exception:
             return QPixmap(thumb_w, thumb_h)
 
+    def update_metadata_json(path, extra_meta, read_metadata_func):
+        """
+        Fuse new external metadata with the extracted metadata. 
+        Merge new external metadata with the existing metadata (JSON + hardware).
+        - path: Path to the original data file (TIFF/JPK/etc.)
+        - extra_meta: Dictionary containing new metadata to merge (e.g., uv_state, uv_on_frame)
+        - read_metadata_func: the function _read_metadata_jpk
+        """
+            json_path = path.with_suffix(".json")
+        
+            # 1) Leer metadatos existentes (JSON o hardware)
+            base_meta = read_metadata_func(str(path))
+
+            # 2) Fusionar con los nuevos
+            merged = {**base_meta, **extra_meta}
+
+            # 3) Guardar JSON actualizado
+            try:
+                with open(json_path, "w") as f:
+                    json.dump(merged, f, indent=4)
+            except Exception as e:
+                print("DEBUG: error writing merged metadata:", e)
+
+            return merged
+
     def update_metadata_panel(self):
-        # Num Imgs
-        num_imgs = self.meta.get("total_frames")
+        # --- Num Imgs ---
+        num_imgs = self.resolve_meta_value(self.meta, "num_imgs")
         if num_imgs is None and self.original_stack is not None:
             num_imgs = self.original_stack.shape[0]
         self.meta_labels["num_imgs"].setText(str(num_imgs) if num_imgs is not None else "-")
 
-        # --- X/Y pixels: usar SIEMPRE los metadatos JPK si existen ---
-        x_pixels = self.meta.get("x_pixels")
-        y_pixels = self.meta.get("y_pixels")
+        # --- X/Y pixels ---
+        x_pixels = self.resolve_meta_value(self.meta, "x_pixels")
+        y_pixels = self.resolve_meta_value(self.meta, "y_pixels")
 
-        # fallback solo si no hay metadatos
         if (x_pixels is None or y_pixels is None) and self.original_stack is not None:
             y_pixels = self.original_stack.shape[-2]
             x_pixels = self.original_stack.shape[-1]
@@ -1375,44 +1446,47 @@ class AFMLoaderWidget(QWidget):
         self.meta_labels["y_pixels"].setText(str(y_pixels) if y_pixels is not None else "-")
 
         # --- FPS reales ---
-        frame_rate = self.meta.get("frame_rate")
-        real_fps = self.meta.get("real_fps") or self.meta.get("real_FPS")
-        try:
-            if real_fps is None and frame_rate is not None and x_pixels not in (None, 0):
-                real_fps = float(frame_rate) / float(x_pixels)
-        except Exception:
-            real_fps = None
-        if real_fps is not None:
-            self.meta["real_fps"] = float(real_fps)
+        real_fps = self.resolve_meta_value(self.meta, "real_fps")
+        frame_rate = self.resolve_meta_value(self.meta, "frame_rate")
+
+        # fallback: derive FPS if possible
+        if real_fps is None and frame_rate is not None:
+            try:
+                real_fps = float(frame_rate)
+            except Exception:
+                real_fps = None
 
         self.meta_labels["real_fps"].setText(f"{real_fps:.3f}" if real_fps is not None else "-")
 
-
-        # X-Range (nm)
-        x_range = self.meta.get("x_range_nm")
+        # --- X-Range (nm) ---
+        x_range = self.resolve_meta_value(self.meta, "x_range_nm")
         self.meta_labels["x_range_nm"].setText(str(x_range) if x_range is not None else "-")
 
-        z_display_min = self.meta.get("z_display_min_nm", self.meta.get("z_data_min_nm"))
-        z_display_max = self.meta.get("z_display_max_nm", self.meta.get("z_data_max_nm"))
+        # --- Z min / Z max ---
+        z_min = self.resolve_meta_value(self.meta, "z_display_min_nm") or \
+                self.resolve_meta_value(self.meta, "z_data_min_nm")
+        z_max = self.resolve_meta_value(self.meta, "z_display_max_nm") or \
+                self.resolve_meta_value(self.meta, "z_data_max_nm")
+
         self.meta_labels["z_display_min_nm"].setText(
-            f"{float(z_display_min):.6g}" if z_display_min is not None else "-"
+            f"{float(z_min):.6g}" if z_min is not None else "-"
         )
         self.meta_labels["z_display_max_nm"].setText(
-            f"{float(z_display_max):.6g}" if z_display_max is not None else "-"
+            f"{float(z_max):.6g}" if z_max is not None else "-"
         )
 
-        # Frame rate
-        frame_rate = self.meta.get("frame_rate")
+        # --- Frame rate (raw) ---
         self.meta_labels["frame_rate"].setText(str(frame_rate) if frame_rate is not None else "-")
 
-        # Channel
-        channel = self.meta.get("channel")
+        # --- Channel ---
+        channel = self.resolve_meta_value(self.meta, "channel")
         self.meta_labels["channel"].setText(str(channel) if channel not in (None, "unknown") else "-")
 
-        # Pixel size (si quieres derivarlo)
-        pixel_size = self.meta.get("pixel_size_nm")
+        # --- Pixel size (nm/pixel) ---
+        pixel_size = self.resolve_meta_value(self.meta, "pixel_size_nm")
         if pixel_size is None and x_range is not None and x_pixels not in (None, 0):
             pixel_size = x_range / x_pixels
+
         self.meta_labels["pixel_size_nm"].setText(str(pixel_size) if pixel_size is not None else "-")
 
 
@@ -1499,7 +1573,7 @@ class AFMLoaderWidget(QWidget):
             return
 
         # Reset metadata
-        self.meta = {}
+        #self.meta = {}
 
         # Collect selected supported files.
         sel_paths = sorted(

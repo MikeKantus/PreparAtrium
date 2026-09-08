@@ -1,4 +1,5 @@
-#gui/drift_panel.py
+# gui/drift_panel.py
+# Panel for visualizing and correcting drift in image stacks.
 import json
 import sys
 import time

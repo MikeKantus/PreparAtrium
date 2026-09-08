@@ -5,6 +5,7 @@ import os
 import io
 import json
 import time
+import re
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -22,6 +23,8 @@ from AFMReader.spm import load_spm
 from PySide6.QtCore import Qt, QTimer, QSize
 from core.ui_utils import frame_to_qimage_safe
 from core.preloader_hsafm import preload_hsafm_folder
+from core.afm_filters import despike_outliers, line_level, median_filter, plane_fit_subtract
+from core.video_annotations import annotate_frame
 from playnano.processing.filters import (
     remove_plane,
     row_median_align,
@@ -57,6 +60,52 @@ def numpy_to_qimage(frame):
     h, w = arr.shape
     bytes_per_line = w
     return QImage(arr.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+
+
+def _natural_path_key(path):
+    """Sort frame files consistently, including numeric portions of their names."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", os.path.basename(path))]
+
+
+def _z_scale_limit_nm(metadata):
+    """Return a positive physical Z-scale limit from common AFM metadata fields."""
+    metadata = metadata or {}
+    for key in ("z_scale_max_nm", "z_scale_nm", "z_max_nm", "z_range_nm", "z_scale", "z_max"):
+        try:
+            value = float(metadata[key])
+            if np.isfinite(value) and value > 0:
+                return value
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        extension = float(metadata["z_piezo_extension"])
+        gain = float(metadata.get("z_piezo_gain", 1.0))
+        value = extension * gain
+        return value if np.isfinite(value) and value > 0 else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _persist_z_scale_metadata(metadata, frames, json_path):
+    """Add physical Z limits from converted frames and persist them in the sidecar JSON."""
+    values = np.asarray(frames, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size:
+        metadata["z_scale_min_nm"] = float(np.min(values))
+        metadata["z_scale_max_nm"] = float(np.max(values))
+    with open(json_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+    return metadata
+
+
+def _zero_baseline_per_frame(frames):
+    """Shift each finite frame independently so its minimum height is zero."""
+    normalized = np.asarray(frames, dtype=np.float32).copy()
+    for frame in normalized:
+        finite = np.isfinite(frame)
+        if finite.any():
+            frame[finite] -= np.min(frame[finite])
+    return normalized
 
 
 class AFMLoaderWidget(QWidget):
@@ -144,6 +193,23 @@ class AFMLoaderWidget(QWidget):
         self.checkbox_overlay.setChecked(False)
         self.checkbox_overlay_frame = QCheckBox("Overlay frame #")
         self.checkbox_overlay_frame.setChecked(False)
+        self.combo_overlay_text_size = QComboBox()
+        self.combo_overlay_text_size.addItems(["Small", "Medium", "Large"])
+        self.combo_overlay_text_size.setCurrentText("Medium")
+        self.combo_overlay_text_color = QComboBox()
+        self.combo_overlay_text_color.addItems(["White", "Black", "Yellow", "Cyan", "Red"])
+        self.combo_overlay_text_color.setCurrentText("White")
+        self.checkbox_scale_bar = QCheckBox("Scale bar (1/5 width)")
+        self.checkbox_scale_bar.setChecked(False)
+        self.combo_scale_bar_color = QComboBox()
+        self.combo_scale_bar_color.addItems(["White", "Black", "Yellow", "Cyan", "Red"])
+        self.combo_scale_bar_color.setCurrentText("White")
+        self.combo_color_palette = QComboBox()
+        self.combo_color_palette.addItems(["Grayscale", "Viridis", "Plasma", "Turbo", "Hot"])
+        self.z_grayscale_max_input = QLineEdit()
+        self.z_grayscale_max_input.setPlaceholderText("Automatic")
+        self.z_grayscale_max_input.setToolTip("Maximum height in nm shown by the grayscale")
+        self.z_grayscale_max_input.editingFinished.connect(self._update_grayscale_z_max)
 
         # Playback controls
         self.btn_play = QPushButton("Play")
@@ -273,53 +339,52 @@ class AFMLoaderWidget(QWidget):
         # --- Advanced Leveling / Flattening Controls ---
        
         layout_adv = QVBoxLayout()
-        # Window size (nm)
-        self.slider_window_nm = QSlider(Qt.Horizontal)
-        self.slider_window_nm.setMinimum(1)
-        self.slider_window_nm.setMaximum(50)
-        self.slider_window_nm.setValue(5)
-        layout_adv.addWidget(QLabel("Window size (nm)"))
-        layout_adv.addWidget(self.slider_window_nm)
+        self.chk_plane_level = QCheckBox("Robust plane leveling")
+        self.chk_plane_level.setChecked(True)
+        self.spin_plane_order = QSpinBox()
+        self.spin_plane_order.setRange(1, 3)
+        self.spin_plane_order.setValue(1)
+        self.spin_plane_iterations = QSpinBox()
+        self.spin_plane_iterations.setRange(1, 10)
+        self.spin_plane_iterations.setValue(3)
+        plane_layout = QHBoxLayout()
+        plane_layout.addWidget(QLabel("Plane order"))
+        plane_layout.addWidget(self.spin_plane_order)
+        plane_layout.addWidget(QLabel("Robust passes"))
+        plane_layout.addWidget(self.spin_plane_iterations)
+        layout_adv.addWidget(self.chk_plane_level)
+        layout_adv.addLayout(plane_layout)
 
-        # Step size (nm)
-        self.slider_step_nm = QSlider(Qt.Horizontal)
-        self.slider_step_nm.setMinimum(1)
-        self.slider_step_nm.setMaximum(20)
-        self.slider_step_nm.setValue(2)
-        layout_adv.addWidget(QLabel("Step size (nm)"))
-        layout_adv.addWidget(self.slider_step_nm)
+        self.combo_line_level = QComboBox()
+        self.combo_line_level.addItems(["No line leveling", "Median offset", "Median slope", "Mean offset", "Mean slope"])
+        layout_adv.addWidget(QLabel("Line leveling"))
+        layout_adv.addWidget(self.combo_line_level)
 
-        # Block size (px)
-        self.slider_block_px = QSlider(Qt.Horizontal)
-        self.slider_block_px.setMinimum(8)
-        self.slider_block_px.setMaximum(256)
-        self.slider_block_px.setValue(64)
-        layout_adv.addWidget(QLabel("Block size (px)"))
-        layout_adv.addWidget(self.slider_block_px)
+        self.chk_median_filter = QCheckBox("Median filter")
+        self.spin_median_size = QSpinBox()
+        self.spin_median_size.setRange(1, 15)
+        self.spin_median_size.setSingleStep(2)
+        self.spin_median_size.setValue(3)
+        median_layout = QHBoxLayout()
+        median_layout.addWidget(self.chk_median_filter)
+        median_layout.addWidget(QLabel("Kernel"))
+        median_layout.addWidget(self.spin_median_size)
+        layout_adv.addLayout(median_layout)
 
-        # Polynomial order
-        self.slider_poly_order = QSlider(Qt.Horizontal)
-        self.slider_poly_order.setMinimum(1)
-        self.slider_poly_order.setMaximum(5)
-        self.slider_poly_order.setValue(2)
-        layout_adv.addWidget(QLabel("Polynomial order"))
-        layout_adv.addWidget(self.slider_poly_order)
-
-        # Smoothing sigma
-        self.slider_smooth_sigma = QSlider(Qt.Horizontal)
-        self.slider_smooth_sigma.setMinimum(0)
-        self.slider_smooth_sigma.setMaximum(10)
-        self.slider_smooth_sigma.setValue(0)
-        layout_adv.addWidget(QLabel("Smoothing sigma"))
-        layout_adv.addWidget(self.slider_smooth_sigma)
-
-        # Iterations
-        self.slider_iterations = QSlider(Qt.Horizontal)
-        self.slider_iterations.setMinimum(1)
-        self.slider_iterations.setMaximum(5)
-        self.slider_iterations.setValue(1)
-        layout_adv.addWidget(QLabel("Iterations"))
-        layout_adv.addWidget(self.slider_iterations)
+        self.chk_despike = QCheckBox("Remove local spikes")
+        self.spin_despike_sigma = QSpinBox()
+        self.spin_despike_sigma.setRange(1, 10)
+        self.spin_despike_sigma.setValue(3)
+        self.spin_despike_neighborhood = QSpinBox()
+        self.spin_despike_neighborhood.setRange(1, 7)
+        self.spin_despike_neighborhood.setValue(3)
+        despike_layout = QHBoxLayout()
+        despike_layout.addWidget(self.chk_despike)
+        despike_layout.addWidget(QLabel("Sigma"))
+        despike_layout.addWidget(self.spin_despike_sigma)
+        despike_layout.addWidget(QLabel("Radius"))
+        despike_layout.addWidget(self.spin_despike_neighborhood)
+        layout_adv.addLayout(despike_layout)
 
         # Apply advanced pipeline button, accept and restart
         self.btn_apply_advanced = QPushButton("Apply Advanced Leveling")
@@ -343,11 +408,17 @@ class AFMLoaderWidget(QWidget):
 
         # Explorer connections
         self.btn_refresh_files.clicked.connect(lambda: self.populate_parent_combo(getattr(self, "current_file_or_folder", os.getcwd())))
-        self.btn_apply_advanced.clicked.connect(lambda: self.apply_advanced_pipeline(self.processed_stack))
+        self.btn_apply_advanced.clicked.connect(lambda: self.apply_advanced_pipeline(self.current_stack))
         self.btn_open_in_explorer.clicked.connect(self.open_selected_folder_in_explorer)
         self.combo_parent_files.currentIndexChanged.connect(lambda idx: self.refresh_file_preview())
         self.btn_accept.clicked.connect(self.accept_preview)
         self.btn_restart.clicked.connect(self.restart_editing)
+        for control in (self.checkbox_overlay, self.checkbox_overlay_frame, self.checkbox_scale_bar):
+            control.toggled.connect(self.update_preview)
+        self.combo_overlay_text_size.currentTextChanged.connect(self.update_preview)
+        self.combo_overlay_text_color.currentTextChanged.connect(self.update_preview)
+        self.combo_scale_bar_color.currentTextChanged.connect(self.update_preview)
+        self.combo_color_palette.currentTextChanged.connect(self.update_preview)
         
         # Si quieres que la preview se llene al inicio, llama populate_parent_combo tras definir current_file_or_folder
 
@@ -362,6 +433,17 @@ class AFMLoaderWidget(QWidget):
         hist_controls.addWidget(self.slider_upper)
         hist_controls.addWidget(self.checkbox_overlay)
         hist_controls.addWidget(self.checkbox_overlay_frame)
+        hist_controls.addWidget(QLabel("Overlay text size"))
+        hist_controls.addWidget(self.combo_overlay_text_size)
+        hist_controls.addWidget(QLabel("Overlay text color"))
+        hist_controls.addWidget(self.combo_overlay_text_color)
+        hist_controls.addWidget(self.checkbox_scale_bar)
+        hist_controls.addWidget(QLabel("Scale bar color"))
+        hist_controls.addWidget(self.combo_scale_bar_color)
+        hist_controls.addWidget(QLabel("Video palette"))
+        hist_controls.addWidget(self.combo_color_palette)
+        hist_controls.addWidget(QLabel("Grayscale Z max (nm)"))
+        hist_controls.addWidget(self.z_grayscale_max_input)
         center_col.addLayout(hist_controls)
 
         play_row = QHBoxLayout()
@@ -411,6 +493,8 @@ class AFMLoaderWidget(QWidget):
             ("Num Imgs", "num_imgs"),
             ("Pixel/nm", "pixel_size_nm"),
             ("X-Range (nm)", "x_range_nm"),
+            ("Z min (nm)", "z_display_min_nm"),
+            ("Z max (nm)", "z_display_max_nm"),
             ("Line/s", "frame_rate"),
             ("FPS", "real_fps"),
             ("y pixels", "y_pixels"),
@@ -486,7 +570,7 @@ class AFMLoaderWidget(QWidget):
                     tiffs = sorted([
                         os.path.join(path, f)
                         for f in os.listdir(path)
-                        if f.startswith(os.path.basename(base)) and f.endswith(".tif")
+                        if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")
                     ])
 
                     if tiffs and (expected_frames is None or len(tiffs) == expected_frames):
@@ -545,7 +629,7 @@ class AFMLoaderWidget(QWidget):
 
                 # Guardar TIFFs
                 for i, frame in enumerate(frames):
-                    tif_path = f"{base}_frame{i}.tif"
+                    tif_path = f"{base}_frame{i:04d}.tif"
                     tifffile.imwrite(tif_path, frame.astype(np.float32))
                     generated_tiffs.append(tif_path)
 
@@ -559,7 +643,7 @@ class AFMLoaderWidget(QWidget):
 
 
         # 3) STP
-        stp_files = [f for f in os.listdir(path) if f.lower().endswith((".stp", ".spm"))]
+        stp_files = [f for f in os.listdir(path) if f.lower().endswith((".stp", ".spm", ".stm"))]
         if stp_files:
             generated_tiffs = []
             for fname in stp_files:
@@ -568,13 +652,18 @@ class AFMLoaderWidget(QWidget):
                 out_json = base + ".json"
 
                 if os.path.exists(out_json):
+                    with open(out_json, "r", encoding="utf-8") as metadata_file:
+                        meta = json.load(metadata_file)
                     tiffs = sorted([
                         os.path.join(path, f)
                         for f in os.listdir(path)
-                        if f.startswith(os.path.basename(base)) and f.endswith(".tif")
+                        if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")
                     ])
-                    generated_tiffs.extend(tiffs)
-                    continue
+                    if len(tiffs) == 1:
+                        if "z_scale_max_nm" not in meta:
+                            meta = _persist_z_scale_metadata(meta, tifffile.imread(tiffs[0]), out_json)
+                        generated_tiffs.extend(tiffs)
+                        continue
 
                 image, px_nm = load_spm(full, channel="Height")
                 frames = image[np.newaxis, :]
@@ -589,14 +678,13 @@ class AFMLoaderWidget(QWidget):
                     "channel": "Height",
                     "num_imgs": frames.shape[0]
                 }
+                meta = _persist_z_scale_metadata(meta, frames, out_json)
 
                 for i, frame in enumerate(frames):
                     tif_path = f"{base}_frame{i}.tif"
-                    tifffile.imwrite(tif_path, frame.astype(np.float32))
+                    if not os.path.exists(tif_path):
+                        tifffile.imwrite(tif_path, frame.astype(np.float32))
                     generated_tiffs.append(tif_path)
-
-                with open(out_json, "w") as f:
-                    json.dump(meta, f, indent=2)
 
             self._populate_from_file_list(generated_tiffs)
             self.status_label.setText(f"Preview folder: {os.path.basename(path)}")
@@ -714,6 +802,7 @@ class AFMLoaderWidget(QWidget):
 
     def _populate_from_file_list(self, paths):
         paths = [p for p in paths if not p.lower().endswith(".jpk")]
+        previous_signal_state = self.list_files.blockSignals(True)
         self.list_files.clear()
         self._file_index = []
         self.meta = {}   # reiniciar metadatos para nueva selección
@@ -783,6 +872,7 @@ class AFMLoaderWidget(QWidget):
         # -----------------------------
         # 4) Actualizar panel de metadatos
         # -----------------------------
+        self.list_files.blockSignals(previous_signal_state)
         self.update_metadata_panel()
         self.status_label.setText(
             f"Found {len(self._file_index)} files. Select one or more to build the video."
@@ -817,7 +907,7 @@ class AFMLoaderWidget(QWidget):
         # ------------------------------------------------------------
         # 2) STP/SPM → JSON generado en preview_folder_contents
         # ------------------------------------------------------------
-        if path_lower.endswith((".stp", ".spm")):
+        if path_lower.endswith((".stp", ".spm", ".stm")):
             return {}
 
         # ------------------------------------------------------------
@@ -1009,6 +1099,12 @@ class AFMLoaderWidget(QWidget):
             # Fallback: read metadata from JPK
             meta = self._read_metadata_jpk(jpk_path)
 
+        meta = dict(meta or {})
+        if os.path.isfile(jpk_path):
+            meta["_source_format"] = "jpk"
+        frame_base = os.path.splitext(tiff_path)[0]
+        if "_frame" in frame_base and os.path.isfile(frame_base.rsplit("_frame", 1)[0] + ".asd"):
+            meta["_source_format"] = "asd"
         return frame, meta
 
     def _read_file_to_frames(self, p):
@@ -1021,7 +1117,7 @@ class AFMLoaderWidget(QWidget):
         # ------------------------------------------------------------
         # STP / SPM files (Bruker) — MODE A: TIFF PER FRAME
         # ------------------------------------------------------------
-        if p.lower().endswith(".stp") or p.lower().endswith(".spm"):
+        if p.lower().endswith((".stp", ".spm", ".stm")):
             from AFMReader.stp import load_spm
 
             base = os.path.splitext(p)[0]
@@ -1033,10 +1129,13 @@ class AFMLoaderWidget(QWidget):
                     meta = json.load(f)
 
                 tiffs = sorted([f for f in os.listdir(os.path.dirname(p))
-                                if f.startswith(os.path.basename(base)) and f.endswith(".tif")])
-
-                frames = [tifffile.imread(os.path.join(os.path.dirname(p), t)) for t in tiffs]
-                return np.stack(frames, axis=0), meta
+                                if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")])
+                if len(tiffs) == 1:
+                    frames = [tifffile.imread(os.path.join(os.path.dirname(p), t)) for t in tiffs]
+                    frames = np.stack(frames, axis=0)
+                    if "z_scale_max_nm" not in meta:
+                        meta = _persist_z_scale_metadata(meta, frames, out_json)
+                    return frames, meta
 
             # Decodificar STP
             image, px_nm = load_spm(p, channel="Height")
@@ -1052,14 +1151,14 @@ class AFMLoaderWidget(QWidget):
                 "channel": "Height",
                 "num_imgs": frames.shape[0]
             }
+            meta = _persist_z_scale_metadata(meta, frames, out_json)
 
             # Guardar TIFF por frame
             for i, frame in enumerate(frames):
-                tifffile.imwrite(f"{base}_frame{i}.tif", frame.astype(np.float32))
+                tif_path = f"{base}_frame{i}.tif"
+                if not os.path.exists(tif_path):
+                    tifffile.imwrite(tif_path, frame.astype(np.float32))
 
-            # Save JSON.
-            with open(out_json, "w") as f:
-                json.dump(meta, f, indent=2)
             return frames, meta
 
 
@@ -1081,10 +1180,13 @@ class AFMLoaderWidget(QWidget):
 
                 # cargar todos los TIFF generados
                 tiffs = sorted([f for f in os.listdir(os.path.dirname(p))
-                                if f.startswith(os.path.basename(base)) and f.endswith(".tif")])
-
-                frames = [tifffile.imread(os.path.join(os.path.dirname(p), t)) for t in tiffs]
-                return np.stack(frames, axis=0), meta
+                                if f.startswith(os.path.basename(base) + "_frame") and f.lower().endswith(".tif")])
+                expected_frames = meta.get("num_imgs")
+                if tiffs and (expected_frames is None or len(tiffs) == expected_frames):
+                    frames = [tifffile.imread(os.path.join(os.path.dirname(p), t)) for t in tiffs]
+                    meta = dict(meta)
+                    meta["_source_format"] = "asd"
+                    return np.stack(frames, axis=0), meta
 
             # Decodificar ASD
             obj = load_asd(p)
@@ -1097,12 +1199,16 @@ class AFMLoaderWidget(QWidget):
 
             # Guardar TIFF por frame
             for i, frame in enumerate(frames):
-                tifffile.imwrite(f"{base}_frame{i}.tif", frame.astype(np.float32))
+                tif_path = f"{base}_frame{i:04d}.tif"
+                if not os.path.exists(tif_path):
+                    tifffile.imwrite(tif_path, frame.astype(np.float32))
 
             # Guardar metadatos globales
             with open(out_json, "w") as f:
                 json.dump(meta, f, indent=2)
 
+            meta = dict(meta)
+            meta["_source_format"] = "asd"
             return frames, meta
 
         # TIFF: load the image and its JSON/JPK metadata.
@@ -1270,12 +1376,14 @@ class AFMLoaderWidget(QWidget):
 
         # --- FPS reales ---
         frame_rate = self.meta.get("frame_rate")
-        real_fps = None
+        real_fps = self.meta.get("real_fps") or self.meta.get("real_FPS")
         try:
-            if frame_rate is not None and x_pixels not in (None, 0):
+            if real_fps is None and frame_rate is not None and x_pixels not in (None, 0):
                 real_fps = float(frame_rate) / float(x_pixels)
         except Exception:
             real_fps = None
+        if real_fps is not None:
+            self.meta["real_fps"] = float(real_fps)
 
         self.meta_labels["real_fps"].setText(f"{real_fps:.3f}" if real_fps is not None else "-")
 
@@ -1283,6 +1391,15 @@ class AFMLoaderWidget(QWidget):
         # X-Range (nm)
         x_range = self.meta.get("x_range_nm")
         self.meta_labels["x_range_nm"].setText(str(x_range) if x_range is not None else "-")
+
+        z_display_min = self.meta.get("z_display_min_nm", self.meta.get("z_data_min_nm"))
+        z_display_max = self.meta.get("z_display_max_nm", self.meta.get("z_data_max_nm"))
+        self.meta_labels["z_display_min_nm"].setText(
+            f"{float(z_display_min):.6g}" if z_display_min is not None else "-"
+        )
+        self.meta_labels["z_display_max_nm"].setText(
+            f"{float(z_display_max):.6g}" if z_display_max is not None else "-"
+        )
 
         # Frame rate
         frame_rate = self.meta.get("frame_rate")
@@ -1385,7 +1502,10 @@ class AFMLoaderWidget(QWidget):
         self.meta = {}
 
         # Collect selected supported files.
-        sel_paths = [it.data(Qt.UserRole) for it in selected_items if it.data(Qt.UserRole)]
+        sel_paths = sorted(
+            (it.data(Qt.UserRole) for it in selected_items if it.data(Qt.UserRole)),
+            key=_natural_path_key,
+        )
         if not sel_paths:
             self.status_label.setText("No valid files selected.")
             return
@@ -1409,6 +1529,8 @@ class AFMLoaderWidget(QWidget):
                 else:
                     raise ValueError(f"Invalid TIFF shape: {img.shape}")
 
+                if (file_meta or {}).get("_source_format") == "asd":
+                    img = _zero_baseline_per_frame(img)
                 all_frames.append(img)
                 file_metas.append(file_meta or {})
                 total_frames += img.shape[0]
@@ -1432,6 +1554,7 @@ class AFMLoaderWidget(QWidget):
         self.original_stack = new_stack.astype(np.float32)
         self.current_stack = self.original_stack.copy()
         self.processed_stack = None
+        self.current_frame = 0
 
         # ---------------------------------------------------------
         # 4) Use metadata returned by the same loader as the first file.
@@ -1444,12 +1567,42 @@ class AFMLoaderWidget(QWidget):
 
         self.meta["total_frames"] = total_frames
         self.meta["source_files"] = sel_paths
+        finite_values = new_stack[np.isfinite(new_stack)]
+        if finite_values.size:
+            stack_min = float(np.min(finite_values))
+            observed_max = float(np.max(finite_values))
+            self.meta["z_data_min_nm"] = stack_min
+            self.meta["z_data_max_nm"] = observed_max
+            is_jpk_stack = bool(file_metas) and all(
+                file_meta.get("_source_format") == "jpk" for file_meta in file_metas
+            )
+            is_asd_stack = bool(file_metas) and all(
+                file_meta.get("_source_format") == "asd" for file_meta in file_metas
+            )
+            if not is_jpk_stack:
+                self.meta["z_display_min_nm"] = 0.0 if stack_min >= 0 else stack_min
+                if is_asd_stack:
+                    frame_maxima = [
+                        float(np.max(frame[np.isfinite(frame)]))
+                        for frame in new_stack if np.isfinite(frame).any()
+                    ]
+                    self.meta["z_auto_display_max_nm"] = float(np.mean(frame_maxima)) if frame_maxima else observed_max
+                    self.meta["z_display_max_nm"] = self.meta["z_auto_display_max_nm"]
+                else:
+                    calibrated_limits = [
+                        limit for limit in (_z_scale_limit_nm(file_meta) for file_meta in file_metas)
+                        if limit is not None
+                    ]
+                    self.meta["z_display_max_nm"] = max([observed_max, *calibrated_limits])
+                self._set_grayscale_z_max_text()
 
         # ---------------------------------------------------------
         # 5) Update UI
         # ---------------------------------------------------------
         self.spin_frame.setMaximum(len(self.current_stack) - 1)
         self.slider_time.setMaximum(len(self.current_stack) - 1)
+        self.spin_frame.setValue(0)
+        self.slider_time.setValue(0)
 
         self.update_preview()
         self.update_metadata_panel()
@@ -1461,6 +1614,33 @@ class AFMLoaderWidget(QWidget):
     # -------------------------
     # Histogram preview sliders
     # -------------------------
+    def _set_grayscale_z_max_text(self):
+        value = self.meta.get("z_display_max_nm")
+        self.z_grayscale_max_input.blockSignals(True)
+        self.z_grayscale_max_input.setText(f"{float(value):.6g}" if value is not None else "")
+        self.z_grayscale_max_input.blockSignals(False)
+
+    def _update_grayscale_z_max(self):
+        text = self.z_grayscale_max_input.text().strip()
+        if not text:
+            automatic_max = self.meta.get("z_auto_display_max_nm")
+            if automatic_max is not None:
+                self.meta["z_display_max_nm"] = automatic_max
+                self._set_grayscale_z_max_text()
+            self.update_preview()
+            return
+        try:
+            value = float(text)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError
+        except ValueError:
+            self.status_label.setText("Grayscale Z max must be a positive number in nm")
+            self._set_grayscale_z_max_text()
+            return
+        self.meta["z_display_max_nm"] = value
+        self.update_preview()
+        self.update_metadata_panel()
+
     def on_histogram_slider_changed(self, _val=None):
         base = self.current_stack if self.current_stack is not None else self.original_stack
         if base is None:
@@ -1473,11 +1653,14 @@ class AFMLoaderWidget(QWidget):
         try:
             lo = np.percentile(base, lo_pct)
             hi = np.percentile(base, hi_pct)
-            preview_stack = np.clip(base, lo, hi)
+            preview_stack = np.clip(base, lo, hi).astype(np.float32)
+            self.processed_stack = preview_stack
             idx = max(0, min(self.current_frame, len(preview_stack) - 1))
             frame = preview_stack[idx]
             frame_disp = self._overlay_frame(frame, idx)
-            qimg = numpy_to_qimage(frame_disp.astype(np.float32))
+            rgb_frame = np.ascontiguousarray(cv2.cvtColor(frame_disp, cv2.COLOR_BGR2RGB))
+            qimg = QImage(rgb_frame.data, rgb_frame.shape[1], rgb_frame.shape[0],
+                          rgb_frame.strides[0], QImage.Format_RGB888).copy()
             pix = QPixmap.fromImage(qimg)
             pix = pix.scaled(self.label_preview.width(), self.label_preview.height(), Qt.KeepAspectRatio)
             self.label_preview.setPixmap(pix)
@@ -1521,7 +1704,7 @@ class AFMLoaderWidget(QWidget):
             self.status_label.setText("No stack loaded.")
             return
 
-        stack = self.original_stack.copy().astype(np.float64)
+        stack = (self.current_stack if self.current_stack is not None else self.original_stack).copy().astype(np.float64)
 
         level_method = self.combo_level.currentText()
         flat_method = self.combo_flatten.currentText()
@@ -1547,8 +1730,7 @@ class AFMLoaderWidget(QWidget):
                 low_value, high_value = np.percentile(frame, [low, high])
                 frame = np.clip(frame, low_value, high_value)
             elif flat_method == "Polynomial":
-                order = self.slider_poly_order.value()
-                frame = polynomial_flatten(frame, order=order)
+                frame = polynomial_flatten(frame, order=2)
 
 
             stack[i] = frame
@@ -1569,28 +1751,6 @@ class AFMLoaderWidget(QWidget):
         self.update_preview()
         self.populate_list()
 
-    def advanced_level_flatten(
-        self,
-        stack,
-        meta,
-        window_nm=5.0,
-        step_nm=2.0,
-        block_px=64,
-        poly_order=2,
-        smooth_sigma=0.0,
-        iterations=1
-    ):
-        """Apply the advanced pipeline using the imported PlayNano filters."""
-        new_stack = stack.astype(np.float32).copy()
-        for _ in range(iterations):
-            for i in range(len(new_stack)):
-                frame = remove_plane(new_stack[i])
-                frame = polynomial_flatten(frame, order=poly_order)
-                if smooth_sigma > 0:
-                    frame = gaussian_filter(frame, sigma=smooth_sigma)
-                new_stack[i] = frame
-        return new_stack
-        
     def accept_preview(self):
         if self.processed_stack is None:
             self.status_label.setText("No processed stack to accept.")
@@ -1616,38 +1776,6 @@ class AFMLoaderWidget(QWidget):
         #self.update_histogram()
         self.update_metadata_panel()
         self.status_label.setText("Filters applied")
-    def run_advanced_pipeline(self, basic_stack):
-        """
-        Wrapper que recoge parámetros de la interfaz (cuando existan)
-        y llama al pipeline avanzado.
-        """
-
-        # Cuando añadamos sliders, leeremos aquí:
-        # window_nm = self.slider_window_nm.value()
-        # step_nm = self.slider_step_nm.value()
-        # block_px = self.slider_block_px.value()
-        # poly_order = self.slider_poly_order.value()
-        # smooth_sigma = self.slider_smooth.value()
-        # iterations = self.slider_iterations.value()
-
-        # Por ahora, valores por defecto:
-        window_nm = 5.0
-        step_nm = 2.0
-        block_px = 64
-        poly_order = 2
-        smooth_sigma = 0.0
-        iterations = 1
-
-        return self.advanced_level_flatten(
-            basic_stack,
-            self.meta,
-            window_nm,
-            step_nm,
-            block_px,
-            poly_order,
-            smooth_sigma,
-            iterations
-        )
     def apply_advanced_pipeline(self, base_stack):
         if base_stack is None:
             self.status_label.setText("No stack loaded.")
@@ -1655,112 +1783,52 @@ class AFMLoaderWidget(QWidget):
 
         stack = base_stack.copy().astype(np.float64)
 
-        window_nm = self.slider_window_nm.value()
-        step_nm = self.slider_step_nm.value()
-        block_px = self.slider_block_px.value()
-        poly_order = self.slider_poly_order.value()
-        sigma = self.slider_smooth_sigma.value()
-        iterations = self.slider_iterations.value()
+        line_options = {
+            "Median offset": ("median", "offset"),
+            "Median slope": ("median", "slope"),
+            "Mean offset": ("mean", "offset"),
+            "Mean slope": ("mean", "slope"),
+        }
+        line_setting = line_options.get(self.combo_line_level.currentText())
 
-        # Pipeline avanzado iterativo
-        for _ in range(iterations):
-            for i in range(stack.shape[0]):
-                frame = stack[i]
-
-                # 1) Remove plane (tilt)
-                frame = remove_plane(frame)
-
-                # 2) Polynomial flatten
-                frame = polynomial_flatten(frame, order=poly_order)
-
-                # 3) Gaussian smoothing
-                if sigma > 0:
-                    frame = gaussian_filter(frame, sigma=sigma)
-
-                stack[i] = frame
+        for index, frame in enumerate(stack):
+            if self.chk_plane_level.isChecked():
+                frame = plane_fit_subtract(
+                    frame,
+                    order=self.spin_plane_order.value(),
+                    robust=True,
+                    iters=self.spin_plane_iterations.value(),
+                )
+            if line_setting is not None:
+                frame = line_level(frame, method=line_setting[0], fit=line_setting[1])
+            if self.chk_median_filter.isChecked():
+                frame = median_filter(frame, size=self.spin_median_size.value())
+            if self.chk_despike.isChecked():
+                frame, _ = despike_outliers(
+                    frame,
+                    k_sigma=float(self.spin_despike_sigma.value()),
+                    neigh=self.spin_despike_neighborhood.value(),
+                )
+            stack[index] = frame
 
         self.processed_stack = stack.astype(np.float32)
         self.update_preview()
-        self.status_label.setText("Advanced pipeline applied using PlayNano filters.py.")
+        self.status_label.setText("Advanced AFM filters applied.")
 
     # -------------------------
     # Overlay and preview helpers
     # -------------------------
     def _overlay_frame(self, frame, idx):
-        """
-        Return frame with overlay text scaled to image size.
-        Always returns a uint8, C-contiguous 2D array (grayscale).
-        """
-
-        arr = np.asarray(frame)
-
-        if np.isnan(arr).any():
-            arr = arr.copy()
-            arr[np.isnan(arr)] = np.nanmin(arr)
-
-        if arr.dtype != np.float32:
-            arr_f = arr.astype(np.float32)
-        else:
-            arr_f = arr.copy()
-
-        overlay_texts = []
-        if self.checkbox_overlay.isChecked():
-            fps = self.meta.get("frame_rate", None) or 10
-            seconds = idx / float(fps)
-            overlay_texts.append(f"{seconds:.2f} s")
-        if self.checkbox_overlay_frame.isChecked():
-            overlay_texts.append(f"Frame {idx}")
-        if not overlay_texts:
-            img8 = arr_f - np.nanmin(arr_f)
-            rng = np.nanmax(img8)
-            if rng == 0 or np.isnan(rng):
-                rng = 1.0
-            img8 = (img8 / rng * 255.0).astype(np.uint8)
-            return np.ascontiguousarray(img8)
-
-        lo_pct, hi_pct = 0.5, 99.5
-        lo_v = np.percentile(arr_f, lo_pct)
-        hi_v = np.percentile(arr_f, hi_pct)
-        if hi_v <= lo_v:
-            lo_v = np.nanmin(arr_f)
-            hi_v = np.nanmax(arr_f)
-            if hi_v <= lo_v:
-                hi_v = lo_v + 1.0
-        img_clip = np.clip(arr_f, lo_v, hi_v)
-
-        img8 = ((img_clip - lo_v) / (hi_v - lo_v) * 255.0).astype(np.uint8)
-
-        bgr = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
-        text = " | ".join(overlay_texts)
-
-        h, w = img8.shape[:2]
-
-        # ⭐ Escala relativa al ancho, para tamaño visual consistente
-        reference_width = 800  # ajusta este valor si quieres texto más grande/pequeño
-        scale = w / reference_width
-        scale = max(0.5, min(scale, 1.5))  # límites razonables
-
-        thickness = max(1, int(round(scale * 2)))
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-        pad = int(round(6 * scale))
-
-        x0, y0 = 8, 8
-        rect_w = tw + pad * 2
-        rect_h = th + pad * 2
-
-        overlay = bgr.copy()
-        cv2.rectangle(overlay, (x0, y0), (x0 + rect_w, y0 + rect_h), (0, 0, 0), -1)
-        alpha = 0.45
-        cv2.addWeighted(overlay, alpha, bgr, 1 - alpha, 0, bgr)
-
-        text_x = x0 + pad
-        text_y = y0 + pad + th
-        cv2.putText(bgr, text, (text_x, text_y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        return np.ascontiguousarray(gray.astype(np.uint8))
+        return annotate_frame(
+            frame, idx, self.meta,
+            show_timestamp=self.checkbox_overlay.isChecked(),
+            show_frame_number=self.checkbox_overlay_frame.isChecked(),
+            text_size=self.combo_overlay_text_size.currentText(),
+            text_color=self.combo_overlay_text_color.currentText(),
+            show_scale_bar=self.checkbox_scale_bar.isChecked(),
+            scale_bar_color=self.combo_scale_bar_color.currentText(),
+            color_palette=self.combo_color_palette.currentText(),
+        )
 
 
 
@@ -1771,7 +1839,7 @@ class AFMLoaderWidget(QWidget):
         Llamar a esta función después de actualizar self.current_frame,
         self.processed_stack o self.original_stack.
         """
-        base = self.processed_stack if self.processed_stack is not None else self.original_stack
+        base = self.processed_stack if self.processed_stack is not None else self.current_stack
         if base is None:
             self.label_preview.clear()
             return
@@ -1782,12 +1850,9 @@ class AFMLoaderWidget(QWidget):
         # Si aplicas overlays, trabaja sobre copia y no modifiques 'frame' original
         frame_disp = self._overlay_frame(frame, idx)
 
-        # Conversión segura a QImage y QPixmap
-       # Convertir a 2D si viene en RGB
-        if frame_disp.ndim == 3:
-            frame_disp = cv2.cvtColor(frame_disp, cv2.COLOR_BGR2GRAY)
-
-        qimg = frame_to_qimage_safe(frame_disp)
+        rgb_frame = np.ascontiguousarray(cv2.cvtColor(frame_disp, cv2.COLOR_BGR2RGB))
+        qimg = QImage(rgb_frame.data, rgb_frame.shape[1], rgb_frame.shape[0],
+                      rgb_frame.strides[0], QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg)
         pix = pix.scaled(self.label_preview.width(), self.label_preview.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.label_preview.setPixmap(pix)
@@ -1898,19 +1963,11 @@ class AFMLoaderWidget(QWidget):
             H, W = stack[0].shape
             fourcc = cv2.VideoWriter_fourcc(*"XVID")
             fps = self.meta.get("frame_rate", 10) or 10
-            writer = cv2.VideoWriter(path, fourcc, float(fps), (W, H), False)
+            writer = cv2.VideoWriter(path, fourcc, float(fps), (W, H), True)
             if not writer.isOpened():
                 raise OSError(f"Could not open video writer for {path}")
-            meta_frame = self._make_metadata_frame(H, W)
-            writer.write(meta_frame)
-            for f in stack:
-                arr = f.astype(np.float32)
-                lo, hi = np.nanmin(arr), np.nanmax(arr)
-                if hi <= lo:
-                    arr = np.zeros_like(arr, dtype=np.uint8)
-                else:
-                    arr = ((arr - lo) / (hi - lo) * 255.0).astype(np.uint8)
-                writer.write(arr)
+            for index, frame in enumerate(stack):
+                writer.write(self._overlay_frame(frame, index))
             writer.release()
         except Exception as e:
             self.status_label.setText(f"Error saving video: {e}")

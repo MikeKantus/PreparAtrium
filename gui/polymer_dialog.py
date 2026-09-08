@@ -1,3 +1,5 @@
+# gui/polymer_dialog.py
+# Dialog for adjusting polymer detection and filtering parameters with real-time preview on the kymograph canvas.
 import copy
 import numpy as np
 from PySide6.QtCore import Qt

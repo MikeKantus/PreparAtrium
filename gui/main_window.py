@@ -1,4 +1,5 @@
-#gui/main_window.py
+# gui/main_window.py
+# Main application window for PreparAtrium, integrating AFM loader, video display, drift correction, and kymograph analysis panels.
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QFrame,
     QSplitter, QLabel, QPushButton, QSizePolicy, 

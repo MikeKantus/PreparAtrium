@@ -1,3 +1,5 @@
+# gui/preparatrium_drift.py
+# Drift correction utilities for PreparAtrium, including optical flow-based drift estimation and mask propagation.
 import sys
 import time
 import numpy as np

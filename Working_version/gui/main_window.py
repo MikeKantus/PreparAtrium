@@ -267,11 +267,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "video_timer"):
             self.video_timer.stop()
 
-        # Crear el widget de drift si no existe
+        # Crear el widget de drift si no existe, o actualizar si ya existía
         if self.drift_widget is None:
             self.drift_widget = DriftWindow(self.afm_stack, self.afm_meta)
             # Lo añadimos al right_panel layout
             self.right_panel.layout().addWidget(self.drift_widget)
+        else:
+            self.drift_widget.reset_and_load_stack(self.afm_stack, self.afm_meta)
 
         # --- 1) Ocultar/colapsar el panel izquierdo (loader) y poner botón de retorno ---
         if not hasattr(self, "_loader_hidden") or not self._loader_hidden:

@@ -1,6 +1,7 @@
 import numpy as np
 import tifffile as tiff
 import matplotlib.patches as patches
+from pathlib import Path
 
 
 class KymoAnalyzer:
@@ -10,11 +11,27 @@ class KymoAnalyzer:
         self.roi_patch = None
 
     def load_raw_kymo(self, path):
-        return tiff.imread(path).astype(float)
+        path = Path(path)
+        if path.suffix.lower() in {'.csv', '.txt', '.tsv'}:
+            delimiter = '\t' if path.suffix.lower() == '.tsv' else ','
+            kymo = np.loadtxt(path, delimiter=delimiter)
+        else:
+            kymo = tiff.imread(path)
+        return self._validate_kymo(kymo, path)
 
     def load_raw_kymo_array(self, kymo):
         """Load a kymograph produced in memory by KymoPanel."""
-        return np.asarray(kymo, dtype=float).copy()
+        return self._validate_kymo(kymo).copy()
+
+    @staticmethod
+    def _validate_kymo(kymo, path=None):
+        kymo = np.asarray(kymo, dtype=float)
+        source = f" '{path}'" if path is not None else ''
+        if kymo.ndim != 2:
+            raise ValueError(f"Kymograph{source} must be a two-dimensional image, got shape {kymo.shape}.")
+        if kymo.size == 0:
+            raise ValueError(f"Kymograph{source} is empty.")
+        return kymo
 
     def draw_image(self, img, preview=False, pixel_size=1.0, time_per_frame=1.0):
         if img is None or self.ax_img is None:
@@ -35,7 +52,7 @@ class KymoAnalyzer:
             img,
             cmap='viridis',
             extent=[0, width_nm, total_time_s, 0],
-            aspect='equal',
+            aspect='auto',
             vmin=0,
             vmax=1
         )
