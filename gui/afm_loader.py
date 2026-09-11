@@ -114,21 +114,6 @@ def normalize_meta_with_aliases(meta, aliases):
                 normalized[key] = meta[alias]
                 break
     return normalized
-def update_metadata_json(path, extra_meta, read_metadata_func):
-     # 1) Leer metadatos existentes (JSON o hardware)
-    base_meta = read_metadata_func(str(path))
-
-    # 2) Fusionar con los nuevos
-    merged = {**base_meta, **extra_meta}
-
-    # 3) Guardar JSON actualizado
-    try:
-        with open(json_path, "w") as f:
-            json.dump(merged, f, indent=4)
-    except Exception as e:
-        print("DEBUG: error writing merged metadata:", e)
-
-    return merged
 
 class AFMLoaderWidget(QWidget):
     def __init__(self, main_window=None):
@@ -832,12 +817,12 @@ class AFMLoaderWidget(QWidget):
         self.list_files.clear()
         self._file_index = []
         self.meta = {}   # reiniciar metadatos para nueva selección
-       # Nombre base del vídeo original (primer archivo de la lista)
+    
+        # Nombre base del vídeo original (primer archivo de la lista)
         if paths:
-            first = paths[0]          # ESTE es el archivo correcto
+            first = paths[0]
             self.meta["source_name"] = os.path.splitext(os.path.basename(first))[0]
-
-
+    
         for p in paths:
             try:
                 # -----------------------------
@@ -850,35 +835,35 @@ class AFMLoaderWidget(QWidget):
                         self.thumbnail_cache[p] = thumb_small
                     except Exception:
                         self.thumbnail_cache[p] = np.zeros((48, 48), dtype=np.uint8)
-
+    
                 thumb_small = self.thumbnail_cache[p]
                 qimg = numpy_to_qimage(thumb_small)
-
+    
                 # Crear item de la lista
                 item = QListWidgetItem(QIcon(QPixmap.fromImage(qimg)), os.path.basename(p))
                 item.setData(Qt.UserRole, p)
                 self.list_files.addItem(item)
                 self._file_index.append(p)
-
+    
                 # -----------------------------
-                # 2) Cargar metadatos desde JSON
+                # 2) Cargar metadatos desde JSON global
                 # -----------------------------
                 base = os.path.splitext(p)[0]
                 json_guess = base.split("_frame")[0] + ".json"
-
+    
                 if os.path.exists(json_guess):
                     try:
                         with open(json_guess, "r") as f:
                             asd_meta = json.load(f)
-
+    
                         for panel_key in self.meta_aliases.keys():
                             val = self.resolve_meta_value(asd_meta, panel_key)
                             if val is not None:
                                 self.meta[panel_key] = val
-
+    
                     except Exception as e:
                         print("DEBUG: error reading JSON ASD:", e)
-
+    
                 # -----------------------------
                 # 3) Metadatos extendidos (JPK/STP/etc)
                 # -----------------------------
@@ -888,13 +873,12 @@ class AFMLoaderWidget(QWidget):
                         val = self.resolve_meta_value(extra_meta, panel_key)
                         if val is not None:
                             self.meta[panel_key] = val
-
+    
             except Exception as e:
-                # Este except ahora SÍ corresponde al try del for
                 item = QListWidgetItem(f"{os.path.basename(p)}  —  ERROR: {e}")
                 item.setData(Qt.UserRole, p)
                 self.list_files.addItem(item)
-
+    
         # -----------------------------
         # 4) Actualizar panel de metadatos
         # -----------------------------
@@ -906,51 +890,47 @@ class AFMLoaderWidget(QWidget):
 
   
     
+    
+    def resolve_meta_value(self, meta_dict, key):
+        """
+        Devuelve el valor del metadato 'key' buscando en todas sus equivalencias.
+        """
+        aliases = self.meta_aliases.get(key, [key])
+        for name in aliases:
+            if name in meta_dict:
+                return meta_dict[name]
+        return None
     def _read_metadata_jpk(self, path):
         """
         Lee metadatos de archivos JPK, ASD, STP/SPM y TIFF generados.
         Devuelve SIEMPRE un diccionario.
         """
-
+    
         meta = {}
-
-        # Normalizar extensión
+    
         path_lower = path.lower()
         base = os.path.splitext(path)[0]
         json_path = base + ".json"
-
-        # ------------------------------------------------------------
+    
         # 1) Si existe JSON asociado → usarlo directamente
-        #    (ASD, STP/SPM, TIFF generados)
-        # ------------------------------------------------------------
         if os.path.exists(json_path):
             try:
                 with open(json_path, "r") as f:
                     return json.load(f)
             except Exception as e:
                 print("DEBUG error reading JSON:", e)
-                # continuar intentando otras rutas
-
-        # ------------------------------------------------------------
+    
         # 2) STP/SPM → JSON generado en preview_folder_contents
-        # ------------------------------------------------------------
         if path_lower.endswith((".stp", ".spm", ".stm")):
             return {}
-
-        # ------------------------------------------------------------
+    
         # 3) ASD → JSON generado en preview_folder_contents
-        # ------------------------------------------------------------
         if path_lower.endswith(".asd"):
             return {}
-
-        # ------------------------------------------------------------
-        # 4) TIFF normal → intentar leer tags TIFF
-        # ------------------------------------------------------------
+    
+        # 4) TIFF normal → intentar leer JSON global
         if path_lower.endswith(".tif"):
-            # Usar solo JSON si existe
-            base = os.path.splitext(path)[0]
             out_json = base + ".json"
-
             if os.path.exists(out_json):
                 try:
                     with open(out_json, "r") as f:
@@ -958,17 +938,10 @@ class AFMLoaderWidget(QWidget):
                 except Exception as e:
                     print("DEBUG error leyendo JSON:", e)
                     return {}
-
-            # Si no hay JSON, no intentamos leer tags TIFF
             return {}
-
-
-
-        # ------------------------------------------------------------
+    
         # 5) JPK → lógica completa original
-        # ------------------------------------------------------------
         if path_lower.endswith(".jpk"):
-
             scan_fields = {
                 "x_origin_nm": 32832,
                 "y_origin_nm": 32833,
@@ -978,7 +951,7 @@ class AFMLoaderWidget(QWidget):
                 "y_pixels": 32839,
                 "frame_rate": 32841,
             }
-
+    
             cantilever_keys = {
                 "amplitude",
                 "calibration-environment",
@@ -991,11 +964,11 @@ class AFMLoaderWidget(QWidget):
                 "sensitivity",
                 "spring-constant",
             }
-
+    
             feedback_keys = {
                 "setpoint-feedback-settings.relative-setpoint"
             }
-
+    
             def extract_scan(tags):
                 scan = {}
                 for key, code in scan_fields.items():
@@ -1013,7 +986,7 @@ class AFMLoaderWidget(QWidget):
                     except Exception:
                         pass
                 return scan
-
+    
             def extract_cantilever_and_feedback(text):
                 cantilever = {}
                 feedback = {}
@@ -1033,51 +1006,39 @@ class AFMLoaderWidget(QWidget):
                         if full_key in feedback_keys:
                             feedback[full_key] = value
                 return cantilever, feedback
-
+    
             try:
                 with tifffile.TiffFile(path) as tif:
                     scan = {}
                     cantilever = {}
                     feedback = {}
-
+    
                     for page in tif.pages:
                         tags = {tag.code: tag.value for tag in page.tags.values()}
-
+    
                         if not scan:
                             scan = extract_scan(tags)
-
+    
                         for value in tags.values():
                             if isinstance(value, str) and "cantilever-calibration-info" in value:
                                 c, f = extract_cantilever_and_feedback(value)
                                 cantilever.update(c)
                                 feedback.update(f)
-
+    
                     meta.update(scan)
                     meta.update(cantilever)
                     meta.update(feedback)
-
+    
                     if "channel" not in meta:
                         meta["channel"] = None
-
+    
                     return meta
-
+    
             except Exception:
                 return {}
-
-        # ------------------------------------------------------------
+    
         # 6) Otros formatos → sin metadatos
-        # ------------------------------------------------------------
         return {}
-
-    def resolve_meta_value(self, meta_dict, key):
-        """
-        Devuelve el valor del metadato 'key' buscando en todas sus equivalencias.
-        """
-        aliases = self.meta_aliases.get(key, [key])
-        for name in aliases:
-            if name in meta_dict:
-                return meta_dict[name]
-        return None
 
     def _is_metadata_frame(self, frame):
         # Si los primeros bytes son ASCII → es metadatos
@@ -1113,48 +1074,25 @@ class AFMLoaderWidget(QWidget):
         return stack, metas
     def load_tiff_with_metadata(self, tiff_path):
         frame = tifffile.imread(tiff_path)
-
-        # Link TIFF → JPK
+    
         jpk_path = tiff_path.replace(".tif", ".jpk")
         json_path = tiff_path.replace(".tif", ".json")
-
-        # Prefer JSON metadata (faster)
+    
         if os.path.exists(json_path):
             with open(json_path, "r") as f:
                 meta = json.load(f)
         else:
-            # Fallback: read metadata from JPK
             meta = self._read_metadata_jpk(jpk_path)
-        filename = os.path.basename(path).lower()
-
-        if "uv_on" in filename:
-            uv_state = "ON"
-        elif "uv_off" in filename:
-            uv_state = "OFF"
-        else:
-            uv_state = None
-
-        extra_meta = {
-            "uv_state": uv_state,
-            "filename": filename,
-            "frame_index": frame_index,        # <-- IMPORTANTE: AFM Loader ya lo tiene
-        }
-
-        # Si es UV ON, guardamos el frame y el tiempo
-        if uv_state == "ON":
-            extra_meta["uv_on_frame"] = frame_index
-            extra_meta["uv_on_time_s"] = frame_index * time_per_frame
-
-        # ------------------------------------------------------------
-        # FUSIONAR METADATOS (hardware + custom) Y GUARDAR JSON
-        # ------------------------------------------------------------
-        merged_meta = update_metadata_json(path, extra_meta, self._read_metadata_jpk)
+    
         meta = dict(meta or {})
+    
         if os.path.isfile(jpk_path):
             meta["_source_format"] = "jpk"
+    
         frame_base = os.path.splitext(tiff_path)[0]
         if "_frame" in frame_base and os.path.isfile(frame_base.rsplit("_frame", 1)[0] + ".asd"):
             meta["_source_format"] = "asd"
+    
         return frame, meta
 
     def _read_file_to_frames(self, p):
@@ -1571,11 +1509,7 @@ class AFMLoaderWidget(QWidget):
         selected_items = self.list_files.selectedItems()
         if not selected_items:
             return
-
-        # Reset metadata
-        #self.meta = {}
-
-        # Collect selected supported files.
+    
         sel_paths = sorted(
             (it.data(Qt.UserRole) for it in selected_items if it.data(Qt.UserRole)),
             key=_natural_path_key,
@@ -1583,104 +1517,85 @@ class AFMLoaderWidget(QWidget):
         if not sel_paths:
             self.status_label.setText("No valid files selected.")
             return
-
+    
         all_frames = []
         total_frames = 0
-
-        # ---------------------------------------------------------
-        # 1) Load frames through the format-aware loader.
-        # ---------------------------------------------------------
         file_metas = []
+    
         for p in sel_paths:
             try:
                 img, file_meta = self._read_file_to_frames(p)
-
-                # Ensure 3D stack
+    
                 if img.ndim == 2:
                     img = img[np.newaxis, ...]
-                elif img.ndim == 3:
-                    pass
-                else:
+                elif img.ndim != 3:
                     raise ValueError(f"Invalid TIFF shape: {img.shape}")
-
-                if (file_meta or {}).get("_source_format") == "asd":
+    
+                if (file_meta or {}).get("_source_format") in ("asd", "jpk"):
                     img = _zero_baseline_per_frame(img)
+    
                 all_frames.append(img)
                 file_metas.append(file_meta or {})
                 total_frames += img.shape[0]
-
+    
             except Exception as e:
                 self.status_label.setText(f"Error loading {os.path.basename(p)}: {e}")
                 return
-
-        # ---------------------------------------------------------
-        # 2) Concatenate frames
-        # ---------------------------------------------------------
+    
         try:
             new_stack = np.concatenate(all_frames, axis=0)
         except Exception as e:
             self.status_label.setText(f"Error concatenating selected frames: {e}")
             return
-
-        # ---------------------------------------------------------
-        # 3) Assign stacks
-        # ---------------------------------------------------------
+    
         self.original_stack = new_stack.astype(np.float32)
         self.current_stack = self.original_stack.copy()
         self.processed_stack = None
         self.current_frame = 0
-
-        # ---------------------------------------------------------
-        # 4) Use metadata returned by the same loader as the first file.
-        # ---------------------------------------------------------
+    
         meta_json = file_metas[0] if file_metas else {}
         for panel_key in self.meta_aliases.keys():
             val = self.resolve_meta_value(meta_json, panel_key)
             if val is not None:
                 self.meta[panel_key] = val
-
+    
         self.meta["total_frames"] = total_frames
         self.meta["source_files"] = sel_paths
+    
+        # Derive real_fps generically
+        real_fps = self.resolve_meta_value(self.meta, "real_fps")
+        frame_rate = self.resolve_meta_value(self.meta, "frame_rate")
+        x_pixels = self.resolve_meta_value(self.meta, "x_pixels")
+        y_pixels = self.resolve_meta_value(self.meta, "y_pixels")
+    
+        if real_fps is None:
+            try:
+                if frame_rate is not None and y_pixels not in (None, 0):
+                    self.meta["real_fps"] = float(frame_rate) / float(y_pixels)
+                elif frame_rate is not None and x_pixels not in (None, 0):
+                    self.meta["real_fps"] = float(frame_rate) / float(x_pixels)
+                else:
+                    fps_alias = self.resolve_meta_value(self.meta, "real_fps")
+                    if fps_alias is not None:
+                        self.meta["real_fps"] = float(fps_alias)
+            except Exception:
+                pass
+    
         finite_values = new_stack[np.isfinite(new_stack)]
         if finite_values.size:
             stack_min = float(np.min(finite_values))
             observed_max = float(np.max(finite_values))
             self.meta["z_data_min_nm"] = stack_min
             self.meta["z_data_max_nm"] = observed_max
-            is_jpk_stack = bool(file_metas) and all(
-                file_meta.get("_source_format") == "jpk" for file_meta in file_metas
-            )
-            is_asd_stack = bool(file_metas) and all(
-                file_meta.get("_source_format") == "asd" for file_meta in file_metas
-            )
-            if not is_jpk_stack:
-                self.meta["z_display_min_nm"] = 0.0 if stack_min >= 0 else stack_min
-                if is_asd_stack:
-                    frame_maxima = [
-                        float(np.max(frame[np.isfinite(frame)]))
-                        for frame in new_stack if np.isfinite(frame).any()
-                    ]
-                    self.meta["z_auto_display_max_nm"] = float(np.mean(frame_maxima)) if frame_maxima else observed_max
-                    self.meta["z_display_max_nm"] = self.meta["z_auto_display_max_nm"]
-                else:
-                    calibrated_limits = [
-                        limit for limit in (_z_scale_limit_nm(file_meta) for file_meta in file_metas)
-                        if limit is not None
-                    ]
-                    self.meta["z_display_max_nm"] = max([observed_max, *calibrated_limits])
-                self._set_grayscale_z_max_text()
-
-        # ---------------------------------------------------------
-        # 5) Update UI
-        # ---------------------------------------------------------
+    
         self.spin_frame.setMaximum(len(self.current_stack) - 1)
         self.slider_time.setMaximum(len(self.current_stack) - 1)
         self.spin_frame.setValue(0)
         self.slider_time.setValue(0)
-
+    
         self.update_preview()
         self.update_metadata_panel()
-
+    
         self.status_label.setText(
             f"Loaded {total_frames} frames from {len(sel_paths)} selected files"
         )
