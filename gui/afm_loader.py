@@ -1348,22 +1348,22 @@ class AFMLoaderWidget(QWidget):
         - extra_meta: Dictionary containing new metadata to merge (e.g., uv_state, uv_on_frame)
         - read_metadata_func: the function _read_metadata_jpk
         """
-            json_path = path.with_suffix(".json")
-        
-            # 1) Leer metadatos existentes (JSON o hardware)
-            base_meta = read_metadata_func(str(path))
+        json_path = path.with_suffix(".json")
+    
+        # 1) Leer metadatos existentes (JSON o hardware)
+        base_meta = read_metadata_func(str(path))
 
-            # 2) Fusionar con los nuevos
-            merged = {**base_meta, **extra_meta}
+        # 2) Fusionar con los nuevos
+        merged = {**base_meta, **extra_meta}
 
-            # 3) Guardar JSON actualizado
-            try:
-                with open(json_path, "w") as f:
-                    json.dump(merged, f, indent=4)
-            except Exception as e:
-                print("DEBUG: error writing merged metadata:", e)
+        # 3) Guardar JSON actualizado
+        try:
+            with open(json_path, "w") as f:
+                json.dump(merged, f, indent=4)
+        except Exception as e:
+            print("DEBUG: error writing merged metadata:", e)
 
-            return merged
+        return merged
 
     def update_metadata_panel(self):
         # --- Num Imgs ---
